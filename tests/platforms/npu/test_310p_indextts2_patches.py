@@ -64,7 +64,7 @@ class FakeS2MelDecoder(nn.Module):
 
     constructed: list["FakeS2MelDecoder"] = []
 
-    def __init__(self, *, vllm_config=None, prefix: str = "") -> None:
+    def __init__(self, *, vllm_config, prefix: str = "") -> None:
         del vllm_config, prefix
         super().__init__()
         self.s2mel_dit_bf16 = True
@@ -204,7 +204,7 @@ def test_310p_forces_fp16_only_runtime(patch_env):
     probe = patch_env.probe
     probe["is_310p"] = True
     patch_env.dispatch.apply_model_patches(SimpleNamespace(model_arch="IndexTTS25S2MelDecoder"))
-    model = FakeS2MelDecoder()
+    model = FakeS2MelDecoder(vllm_config=object())
     assert len(FakeS2MelDecoder.constructed) == 1
     for field in _SWITCHES:
         assert getattr(model, field) is False, f"{field} must be forced off on 310P"
@@ -214,7 +214,7 @@ def test_non_310p_keeps_configured_runtime(patch_env):
     probe = patch_env.probe
     probe["is_310p"] = False
     patch_env.dispatch.apply_model_patches(SimpleNamespace(model_arch="IndexTTS25S2MelDecoder"))
-    model = FakeS2MelDecoder()
+    model = FakeS2MelDecoder(vllm_config=object())
     # 910 line: the wrapped init must leave the configured switches untouched
     assert model.s2mel_dit_bf16 is True
     assert model.s2mel_dit_torch_compile is True
@@ -233,7 +233,33 @@ def test_apply_is_idempotent(patch_env):
     patch_env.indextts2.apply_indextts2_310p_patches()
     assert FakeS2MelDecoder.__init__ is wrapped_once, "double-wrap detected"
     # Constructing through the once-wrapped init still forces the runtime
-    FakeS2MelDecoder()
+    FakeS2MelDecoder(vllm_config=object())
+    assert FakeS2MelDecoder.constructed[0].s2mel_dit_bf16 is False
+
+
+def test_wrapper_preserves_vllm_config_signature(patch_env):
+    """vLLM's old-style model loader introspects ``__init__`` to guess the
+    constructor arguments and calls ``model_class(**kwargs)``. If the 310P
+    wrapper hid the required keyword-only ``vllm_config`` (e.g. a bare
+    ``*args/**kwargs`` wrapper), vLLM would omit it and construction would
+    fail with ``TypeError: missing 1 required keyword-only argument:
+    'vllm_config'``. Pin the signature contract the loader relies on.
+    """
+    import inspect
+
+    from vllm_omni.model_executor.models.indextts2.indextts2_s2mel_decoder import (
+        IndexTTS2S2MelDecoder as WrappedDecoder,
+    )
+
+    patch_env.probe["is_310p"] = True
+    patch_env.indextts2.apply_indextts2_310p_patches()
+
+    params = inspect.signature(WrappedDecoder.__init__).parameters
+    assert "vllm_config" in params
+    assert params["vllm_config"].kind is inspect.Parameter.KEYWORD_ONLY
+    assert params["vllm_config"].default is inspect.Parameter.empty
+    # And the wrapped init must actually accept the loader's call form.
+    WrappedDecoder(vllm_config=object())
     assert FakeS2MelDecoder.constructed[0].s2mel_dit_bf16 is False
 
 

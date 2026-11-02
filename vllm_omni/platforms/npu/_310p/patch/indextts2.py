@@ -86,8 +86,12 @@ def apply_indextts2_310p_patches() -> None:
     if getattr(original_init, "_indextts2_310p_patched", False):
         return
 
-    def _patched_init(self: object, *args: object, **kwargs: object) -> None:
-        original_init(self, *args, **kwargs)
+    # Mirror the decoder's exact signature: vLLM's old-style model loader
+    # introspects ``__init__`` to guess constructor arguments, so a
+    # ``*args/**kwargs`` wrapper would hide the required keyword-only
+    # ``vllm_config`` and break model construction.
+    def _patched_init(self: object, *, vllm_config: object, prefix: str = "") -> None:
+        original_init(self, vllm_config=vllm_config, prefix=prefix)
         from vllm_omni.platforms.npu._310p import is_310p
 
         if is_310p():
