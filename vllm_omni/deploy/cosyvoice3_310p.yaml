@@ -13,12 +13,16 @@
 #     regardless, this pin keeps the two sides consistent.
 #
 # On the v0.32.0 line the NPU worker selects the MRV1 runner, so no runner
-# selection is overridden here.  Stage 0 keeps the base config's
-# ``enforce_eager: false``: the talker's model-owned RAS sampling is eager
-# torch (no ACL-graph capture), matching the 310P precedent for Qwen3-TTS /
-# VoxCPM2 where the AR side stays engine-managed.
+# selection is overridden here.  Stage 0 is forced ``enforce_eager: true``:
+# the talker samples model-side (per-token Gumbel RAS through the rebound
+# ``random_sample``), which is not ACL-graph capturable on 310P — the same
+# rule every 310P TTS deploy on this node applies (Qwen3-TTS, VoxCPM2,
+# MOSS-TTS all pin enforce_eager on every stage).
 #
 # Usage on the 310P card:
 #   vllm serve <cosyvoice3 model dir> --deploy-config vllm_omni/deploy/cosyvoice3_310p.yaml
 base_config: cosyvoice3.yaml
 dtype: float16
+stages:
+  - stage_id: 0
+    enforce_eager: true
