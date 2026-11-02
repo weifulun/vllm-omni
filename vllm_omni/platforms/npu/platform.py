@@ -13,6 +13,7 @@ from vllm.v1.kv_cache_interface import FullAttentionSpec
 from vllm_ascend.platform import NPUPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
+from vllm_omni.platforms.npu._310p import is_310p
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
 from vllm_omni.platforms.npu._310p import is_310p
 
