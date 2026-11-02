@@ -33,7 +33,7 @@ stages:
     # TP-rank pool ~1.0 GiB (15.38 -> 14.94 GiB ceiling). KV shrinks
     # 0.99 -> ~0.6 GiB; the engine's max-model-length check fails loudly
     # at boot if it is not enough.
-    gpu_memory_utilization: 0.71
+    gpu_memory_utilization: 0.72
     max_model_len: 8192
     # Real-device (128 C1, 2026-11-03): shrink the profile dummy batch to cap the
     # retained caching-allocator blocks under the EH0012 no-op (aee740b99):
@@ -85,7 +85,7 @@ platforms:
         # max_num_batched_tokens note below); keep both layers in sync.
         # boot16 (128 C1): 0.75 -> 0.70, chip1 headroom for the stage-2 TTS
         # flow cache (flat-stage comment carries the full math).
-        gpu_memory_utilization: 0.71
+        gpu_memory_utilization: 0.72
         # Real-device (128 C1, 2026-11-03, boot10-12): the base 910B1 tuning
         # pins 8192 at THIS platform layer (applied after stage parsing, so it
         # wins over the flat stage key). The 8192-token profile dummy leaves a
