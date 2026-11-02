@@ -739,7 +739,10 @@ class MossTTSDelayTalkerForGeneration(nn.Module):
             if name in ("lm_heads.0.weight", "language_model.lm_head.weight"):
                 tgt = "text_lm_head.weight"
                 if tgt in params_dict:
-                    default_weight_loader(params_dict[tgt], tensor)
+                    # TP>1: ParallelLMHead rows are vocab-sharded per rank; use the
+                    # TP-aware weight_loader (narrow by tp_rank) instead of the
+                    # shape-asserting default_weight_loader. Identical at TP1.
+                    params_dict[tgt].weight_loader(params_dict[tgt], tensor)
                     loaded.add(tgt)
                 continue
 
