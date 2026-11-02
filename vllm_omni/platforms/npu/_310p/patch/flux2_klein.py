@@ -96,6 +96,16 @@ _ENCODER_CPU_GUARDED = False
 _ENCODER_CPU_ENV = "FLUX2KLEIN_310P_ENCODER_CPU"
 
 
+def _evidence(tag: str, payload: str) -> None:
+    # File-level probe: spawn workers swallow the logger in flight; the
+    # evidence file survives and makes patch application observable.
+    try:
+        with open("/tmp/310p_flux2_evidence.log", "a") as fh:
+            fh.write(f"{tag} {payload} (pid={os.getpid()})\n")
+    except OSError:
+        pass
+
+
 def _force_fp16(od_config: Any) -> None:
     """Force FP16 (310P invariant; SDXL-line precedent: patch-forced dtype).
 
@@ -418,6 +428,17 @@ def _install_vae_tiling_wrap() -> None:
                 enc_dtype,
             )
             self.text_encoder = self.text_encoder.to(dtype=torch.float16)
+        try:
+            enc_p = next(iter(self.text_encoder.parameters()))
+            vae_p = next(iter(self.vae.parameters()))
+            _evidence(
+                "post-init",
+                f"enc_dev={enc_p.device} enc_dtype={enc_p.dtype} "
+                f"vae_dev={vae_p.device} tiling={self._310p_vae_tiling} "
+                f"env={os.environ.get(_ENCODER_CPU_ENV, '0')}",
+            )
+        except Exception as exc:  # pragma: no cover - probe must never break init
+            _evidence("post-init", f"probe-error {exc!r}")
 
     Flux2KleinPipeline.__init__ = _init_with_vae_tiling
     _VAE_TILING_WRAPPED = True
@@ -485,6 +506,7 @@ def apply_diffusion_310p_patches(od_config: Any) -> None:
     if _APPLIED:
         return
     _APPLIED = True
+    _evidence("apply", f"dtype={getattr(od_config, 'dtype', None)}")
 
     _force_fp16(od_config)
     _validate_attention_selection(od_config)
