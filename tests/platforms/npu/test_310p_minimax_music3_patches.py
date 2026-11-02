@@ -612,3 +612,67 @@ def test_talker_embedding_nz_seam(monkeypatch):
     assert not hasattr(layer, "weight_nz"), "the NZ copy must not be created"
     x = torch.randn(2, 4)
     assert torch.equal(inst.apply(layer, x), F.linear(x, layer.weight))
+
+
+def test_embedding_seam_follows_weight_device(monkeypatch):
+    """The quant_method.embedding seam must look up on the weight's device
+    and hand the result back on the input's device."""
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+
+    class _Method:
+        def embedding(self, layer, input_):
+            return F.embedding(input_, layer.weight)
+
+        def apply(self, layer, x, bias=None):
+            return F.linear(x, getattr(layer, "weight_nz", layer.weight), bias)
+
+    ascend = _install_fake_module(monkeypatch, "vllm_ascend")
+    p310 = _install_fake_module(monkeypatch, "vllm_ascend._310p")
+    ops = _install_fake_module(monkeypatch, "vllm_ascend._310p.ops")
+    vpe = _install_fake_module(
+        monkeypatch,
+        "vllm_ascend._310p.ops.vocab_parallel_embedding",
+        AscendUnquantizedEmbeddingMethod310=_Method,
+    )
+    ascend._310p = p310
+    p310.ops = ops
+    ops.vocab_parallel_embedding = vpe
+
+    patch.apply_talker_patches()
+
+    inst = vpe.AscendUnquantizedEmbeddingMethod310()
+    layer = nn.Embedding(16, 4)
+    ids = torch.tensor([[3, 7, 1]])
+    out = inst.embedding(layer, ids)
+    assert out.device == ids.device
+    assert torch.equal(out, F.embedding(ids, layer.weight))
+
+
+def test_talker_embedding_offload_hook(monkeypatch):
+    """The post-load offload moves embed_tokens and lm_head to the host
+    for the talker architecture and leaves other models untouched."""
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+
+    class _Talker(nn.Module):
+        def __init__(self):
+            super().__init__()
+            inner = nn.Module()
+            inner.embed_tokens = nn.Embedding(16, 4)
+            self.model = inner
+            self.lm_head = nn.Linear(4, 16)
+
+    worker = types.SimpleNamespace(model=_Talker())
+    patch._offload_talker_embeddings_310p(worker)
+    assert worker.model.lm_head.weight.device.type == "cpu"
+    assert worker.model.model.embed_tokens.weight.device.type == "cpu"
+
+    class _NotMusic3(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.touched = False
+
+    other = types.SimpleNamespace(model=_NotMusic3())
+    patch._offload_talker_embeddings_310p(other)
+    assert not other.model.touched

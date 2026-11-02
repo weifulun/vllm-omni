@@ -38,6 +38,13 @@ the host with the same seed and the same ``philox`` value stream.
   would therefore pin ~3.3 GB of permanent duplicates that the 21 GB chip
   cannot absorb on top of the 17.17 GB of weights, so the seam drops the
   NZ copy and runs ``F.linear`` on the plain fp16 weight.
+* The FP16 weights alone (17.17 GB) plus the ~1.3 GB runtime baseline
+  leave ~2.6 GB on the 21 GB chip, which the prefill profiling run
+  consumes before any KV block exists ("No available memory for the cache
+  blocks"). The untied embed_tokens and lm_head (2 x 1.64 GB) are
+  therefore offloaded to the host after loading: the lm_head logits
+  already live on the host for the sampler seams, and the embedding moves
+  are batch x 4096 fp16 in each direction.
 
 Everything here is installed only when the platform already confirmed
 ``is_310p()`` and the model architecture is one of the MiniMax Music 3
@@ -171,8 +178,76 @@ def _embed_process_weights_noop_310p(self, layer: nn.Module) -> None:
 
 
 def _embed_apply_plain_310p(self, layer: nn.Module, x: Tensor, bias: Tensor | None = None) -> Tensor:
-    """F.linear on the plain fp16 weight (generic NPU kernel)."""
-    return F.linear(x, layer.weight, bias)
+    """F.linear on the plain fp16 weight, tracking the weight's device.
+
+    After the host offload the weight lives on CPU and the hidden states
+    arrive on the NPU; the logits then stay on the host, which is where the
+    310P sampler seams already run.
+    """
+    return F.linear(x.to(layer.weight.device), layer.weight, bias)
+
+
+def _embed_embedding_310p(self, layer: nn.Module, input_: Tensor) -> Tensor:
+    """Embedding lookup that follows the weight's device and returns to
+    the input's device (the backbone layers stay on the NPU)."""
+    weight = layer.weight
+    out = F.embedding(input_.to(weight.device), weight)
+    return out.to(input_.device)
+
+
+_TALKER_ARCH_NAME = "MiniMaxMusic3TalkerForConditionalGeneration"
+
+
+def _offload_talker_embeddings_310p(worker) -> None:
+    """Move the untied embed_tokens and lm_head to the host after loading.
+
+    They are 2 x 1.64 GB of fp16 (vocab 200000 x 4096, untied); keeping
+    them on the NPU would leave no room for the KV pool on the 21 GB chip.
+    Per-step traffic is the lm_head logits (already host-side for the
+    sampler seams) plus a batch x 4096 embedding move both ways.
+    """
+    if _kill_switch_off():
+        return
+    model = getattr(worker, "model", None)
+    if model is None or type(model).__name__ != _TALKER_ARCH_NAME:
+        return
+    moved = []
+    targets = (
+        ("embed_tokens", getattr(getattr(model, "model", None), "embed_tokens", None)),
+        ("lm_head", getattr(model, "lm_head", None)),
+    )
+    for name, module in targets:
+        if module is None:
+            continue
+        param = next(module.parameters(), None)
+        if param is None or param.device.type == "cpu":
+            continue
+        module.to("cpu")
+        moved.append(f"{name} {tuple(param.shape)} fp16")
+    if moved:
+        logger.info(
+            "MiniMax Music 3 310P: talker embeddings offloaded to host: %s",
+            ", ".join(moved),
+        )
+
+
+def _wrap_ar_load_model_310p() -> None:
+    """Run the talker embedding offload after the AR worker loads the model."""
+    try:
+        from vllm_omni.platforms.npu.worker import npu_ar_model_runner as _ar_module
+    except ImportError:
+        return  # no AR worker in this environment (host contract tests)
+
+    if getattr(_ar_module.NPUArModelRunner, "_MM3_LOAD_WRAPPED", False):
+        return
+    original = _ar_module.NPUArModelRunner.load_model
+
+    def load_model_310p(self, *args, **kwargs):
+        original(self, *args, **kwargs)
+        _offload_talker_embeddings_310p(self)
+
+    _ar_module.NPUArModelRunner.load_model = load_model_310p
+    _ar_module.NPUArModelRunner._MM3_LOAD_WRAPPED = True
 
 
 def apply_talker_patches() -> None:
@@ -219,10 +294,12 @@ def apply_talker_patches() -> None:
         _method_cls = _vpe310.AscendUnquantizedEmbeddingMethod310
         _method_cls.process_weights_after_loading = _embed_process_weights_noop_310p
         _method_cls.apply = _embed_apply_plain_310p
+        _method_cls.embedding = _embed_embedding_310p
         logger.info(
             "MiniMax Music 3 310P: embedding/LM-head fractal-NZ copies disabled "
             "(plain-fp16 F.linear seam); linear NZ conversion left in place"
         )
+    _wrap_ar_load_model_310p()
 
     _TALKER_PATCHED = True
     logger.info(
