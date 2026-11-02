@@ -7,6 +7,8 @@ from __future__ import annotations
 
 from typing import Any
 
+import math
+
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -70,13 +72,18 @@ def _scaled_dot_product_attention_npu(
             "GQA requires query heads to be a multiple of KV heads, "
             f"got q_heads={num_heads} and kv_heads={num_key_value_heads}."
         )
-    return F.scaled_dot_product_attention(
+    # 310P: torch_npu's SDPA entry point (incl. enable_gqa) is unusable on
+    # this platform; run explicit attention math with KV expansion instead of
+    # the fused GQA kernel (see the sdpa backend 310P fallback).
+    from vllm_omni.diffusion.attention.backends.sdpa import _attention_math_fallback
+
+    return _attention_math_fallback(
         query,
         key,
         value,
-        dropout_p=0.0,
-        is_causal=True,
-        enable_gqa=num_heads != num_key_value_heads,
+        None,
+        True,
+        1.0 / math.sqrt(query.shape[-1]),
     )
 
 

@@ -49,6 +49,61 @@ def _sdpa_uses_expanded_kv(
     )
 
 
+
+def _attention_math_fallback(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: torch.Tensor | None,
+    causal: bool,
+    scale: float,
+) -> torch.Tensor:
+    """Explicit attention math for platforms whose SDPA entry point is unusable.
+
+    310P (Atlas 300I Duo): torch_npu's C++ SDPA dispatch rejects every call
+    ("can not cast format when output is input") and the CANN fused kernel
+    (npu_fusion_attention / FlashAttentionScore) fails AclOpKernelInit, so
+    F.scaled_dot_product_attention has no working implementation there.
+    query/key/value are [B, H, S, D]; attention_mask is an optional
+    broadcastable bool tensor (True = attend); causal adds a trailing tril
+    keep-mask. fp32 softmax upcast for stability.
+    """
+    q_heads, kv_heads = query.shape[1], key.shape[1]
+    if q_heads != kv_heads:
+        if q_heads % kv_heads != 0:
+            raise ValueError(
+                "GQA requires query heads to be a multiple of KV heads, "
+                f"got q_heads={q_heads} and kv_heads={kv_heads}."
+            )
+        rep = q_heads // kv_heads
+        key = key.repeat_interleave(rep, dim=1)
+        value = value.repeat_interleave(rep, dim=1)
+    logits = torch.matmul(query, key.transpose(-2, -1)) * scale
+    if causal:
+        sq, skv = query.shape[2], key.shape[2]
+        keep = torch.ones(sq, skv, dtype=torch.bool, device=logits.device).tril_(diagonal=skv - sq)
+        logits = logits.masked_fill(~keep, float("-inf"))
+    if attention_mask is not None:
+        logits = logits.masked_fill(~attention_mask.bool(), float("-inf"))
+    probs = torch.softmax(logits, dim=-1, dtype=torch.float32).to(query.dtype)
+    return torch.matmul(probs, value)
+
+
+_SDPA_IS_310P_CACHE: bool | None = None
+
+
+def _sdpa_runtime_is_310p() -> bool:
+    global _SDPA_IS_310P_CACHE
+    if _SDPA_IS_310P_CACHE is None:
+        try:
+            from vllm_omni.platforms.npu._310p import is_310p
+
+            _SDPA_IS_310P_CACHE = bool(is_310p())
+        except Exception:  # noqa: BLE001 - non-NPU platforms
+            _SDPA_IS_310P_CACHE = False
+    return _SDPA_IS_310P_CACHE
+
+
 def _sdpa_attention(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -57,6 +112,10 @@ def _sdpa_attention(
     causal: bool,
     scale: float,
 ) -> torch.Tensor:
+    if _sdpa_runtime_is_310p():
+        # 310P: F.sdpa is unusable on this platform (see module notes);
+        # run explicit math with KV expansion instead.
+        return _attention_math_fallback(query, key, value, attention_mask, causal, scale)
     # SDPA requires a concrete bool, not a symbolic head-count comparison.
     enable_gqa = False
     if query.shape[1] != key.shape[1]:
