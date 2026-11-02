@@ -17,7 +17,18 @@ def is_310p(device: torch.device | None = None) -> bool:
 
         return bool(ascend_is_310p())
     except (ImportError, AttributeError):
-        return False
+        # API drift: some vllm_ascend builds expose the build-info based
+        # detector under vllm_ascend.device.device_config instead of
+        # vllm_ascend.utils; without the fallback the whole 310P patch
+        # stack no-ops silently.
+        try:
+            from vllm_ascend.device.device_config import (
+                is_310p as ascend_is_310p_fallback,
+            )
+
+            return bool(ascend_is_310p_fallback())
+        except (ImportError, AttributeError):
+            return False
 
 
 def disable_jit_compile() -> None:
