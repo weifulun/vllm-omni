@@ -451,15 +451,18 @@ def apply_talker_patches() -> None:
 
 
 def _install_decoder_slot_reset_patch() -> None:
-    """aclnn ``inplace_index_fill`` has no DT_INT64 support (EZ1001).
+    """aclnn ``inplace_index_fill`` is unavailable on 310P (EZ1001).
 
     The decoder streaming-state slot offsets are created in int64 by the
     shared module (CUDA semantics); on NPU the ``index_fill_`` that marks a
     reused ring slot invalid fails with
     ``AclNN_Parameter_Error(EZ1001): Tensor self not implemented for
-    DT_INT64``. The 310P codec patch runs the fill through an int32
-    mirror and copies the result back, keeping the shared buffer's dtype
-    and every CUDA code path untouched.
+    DT_INT64`` — and the int32 variant reports an empty dtype support list
+    as well, i.e. the op itself has no 310P aclnn backend. The fill is
+    tiny (layers x capacity counters, request-finish path, not the
+    per-token hot loop), so the 310P codec patch executes it on CPU and
+    copies the buffer back: bit-identical result, one extra H2D of a few
+    KB, shared buffer dtype and every CUDA code path untouched.
     """
     from vllm_omni.model_executor.models.moss_tts import (
         audio_tokenizer as _moss_audio_tokenizer,
@@ -486,10 +489,10 @@ def _install_decoder_slot_reset_patch() -> None:
         offsets = self._decoder_slot_offsets
         # A zero offset marks every old ring-cache entry invalid, so the large
         # KV buffers do not need to be cleared when a slot is reused.
-        if str(offsets.device).startswith("npu") and offsets.dtype == torch.long:
-            mirror = offsets.to(torch.int32)
-            mirror.index_fill_(1, slots.to(torch.int32), 0)
-            offsets.copy_(mirror)
+        if str(offsets.device).startswith("npu"):
+            cpu_offsets = offsets.detach().cpu()
+            cpu_offsets.index_fill_(1, slots.detach().cpu(), 0)
+            offsets.copy_(cpu_offsets)
         else:
             offsets.index_fill_(1, slots, 0)
 
