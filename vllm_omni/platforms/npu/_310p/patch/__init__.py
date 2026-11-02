@@ -8,6 +8,14 @@ from __future__ import annotations
 _WORKER_PATCHED = False
 _QWEN3_TTS_TALKER_ARCH = "Qwen3TTSTalkerForConditionalGeneration"
 _QWEN3_TTS_CODE2WAV_ARCH = "Qwen3TTSCode2Wav"
+# MOSS-TTS full family (model_arch values from the pipeline configs; all four
+# in-scope repos ship ``MossTTSDelayModel``):
+#   * MossTTSDelayModel  — MOSS-TTS 8B / MOSS-TTSD 8B / MOSS-SoundEffect 8B /
+#     MOSS-VoiceGenerator 1.7B (stage 0 talker)
+#   * MossTTSRealtime / MossTTSLocalModel — adjacent variants, same codec stage
+#   * MossTTSCodecDecoder — stage 1 streaming codec (shared by every variant)
+_MOSS_TTS_TALKER_ARCHS = ("MossTTSDelayModel", "MossTTSRealtime", "MossTTSLocalModel")
+_MOSS_TTS_CODEC_ARCH = "MossTTSCodecDecoder"
 
 
 def apply_patches() -> None:
@@ -33,3 +41,13 @@ def apply_model_patches(model_config) -> None:
         from vllm_omni.platforms.npu._310p.patch.qwen3_tts import apply_code2wav_patches
 
         apply_code2wav_patches()
+        return
+    elif model_arch in _MOSS_TTS_TALKER_ARCHS:
+        from vllm_omni.platforms.npu._310p.patch.moss_tts import apply_talker_patches
+
+        apply_talker_patches()
+        return
+    elif model_arch == _MOSS_TTS_CODEC_ARCH:
+        from vllm_omni.platforms.npu._310p.patch.moss_tts import apply_codec_patches
+
+        apply_codec_patches()
