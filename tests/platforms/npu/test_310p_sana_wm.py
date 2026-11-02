@@ -131,6 +131,7 @@ class FakeSanaWmPipeline(torch.nn.Module):
         self.tokenizer = _FakeTokenizer(max_length=300)
         self.text_encoder = _FakeGemmaEncoder()
         self.sana_wm_config = SimpleNamespace(chi_prompt=[], model_max_length=300)
+        self.vae = SimpleNamespace(tile_sample_min_height=512, tile_sample_stride_height=448)
         self._last_prompt_attention_mask = None
 
     def _stage1_prompt_text(self, prompt: dict) -> str:
@@ -275,7 +276,20 @@ def test_pipeline_keeps_encoder_on_device_when_opted_out(monkeypatch: pytest.Mon
     pipe = module._SanaWm310P(od_config=_make_od_config(dtype=torch.float16))
 
     assert pipe._encoder_device() == pipe.device
+    # No CPU pinning happened: the encoder never got a `.to()` call.
     assert pipe.text_encoder.to_calls == []
+
+
+def test_pipeline_disables_vae_vertical_tiling(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_310P_SANA_WM_ENCODER_ON_NPU", raising=False)
+    module, _calls = _load_sana_wm_patch(monkeypatch)
+    pipe = module._SanaWm310P(od_config=_make_od_config(dtype=torch.float16))
+
+    # aclnnReflectionPad3d rejects the 1-row edge tile the LTX-2 loop makes
+    # at 480px height; vertical tiling must be disabled, width tiling kept.
+    assert pipe.vae.tile_sample_min_height == module._VAE_NO_VERTICAL_TILE_MIN_HEIGHT
+    assert pipe.vae.tile_sample_stride_height == module._VAE_NO_VERTICAL_TILE_MIN_HEIGHT
+    assert pipe.vae.tile_sample_min_height > 512
 
 
 def test_ensure_stage1_text_encoder_stays_on_cpu(monkeypatch: pytest.MonkeyPatch) -> None:

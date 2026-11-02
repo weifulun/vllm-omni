@@ -66,6 +66,8 @@ _ENCODER_ON_NPU_ENV = "VLLM_OMNI_310P_SANA_WM_ENCODER_ON_NPU"
 _SANA_WM_ARCH = "SanaWmPipeline"
 _PATCHED = False
 _ORIGINAL_TORCH_CROSS: Any = None
+# Effective "never tile vertically" threshold for the LTX-2 VAE (pixels).
+_VAE_NO_VERTICAL_TILE_MIN_HEIGHT = 10_000_000
 
 __all__ = [
     "_SanaWm310P",
@@ -213,6 +215,7 @@ class _SanaWm310P(SanaWmPipeline):
                 rope, dim, positions
             )
         self._install_310p_rope_apply()
+        self._fixup_vae_tiling_310p()
         if self.text_encoder is not None and not _encoder_on_npu():
             # Preprocessing-only module: keep it off the 310P NPU.
             self.text_encoder.to(device=_CPU_DEVICE, dtype=_RUNTIME_DTYPE)
@@ -246,6 +249,35 @@ class _SanaWm310P(SanaWmPipeline):
                 "[310P] SANA-WM: real-arithmetic RoPE apply installed on %d attention module(s).",
                 installed,
             )
+
+    def _fixup_vae_tiling_310p(self) -> None:
+        """310P: disable the LTX-2 VAE's *vertical* tiling in tiled decode.
+
+        ``aclnnReflectionPad3d`` requires ``pad < dim`` on 310P, while the
+        LTX-2 tile loop (tile 16 latent rows, overlap 2 -> stride 14) produces
+        a degenerate 1-row edge tile for the 480px tier (15 latent rows:
+        rows 0..14 and 14..14); the conv-in reflect pad (pad 1) on that
+        1-row axis is rejected by the kernel (EZ1001 "padding size should be
+        less than the corresponding self dimention").  With
+        ``tile_sample_min_height`` *and* ``tile_sample_stride_height`` raised
+        above any tier height the H axis becomes a single full-height tile (the
+        row loop steps by the stride; both must be huge), with no vertical
+        seams to blend; the width tiling (16 of 26 latent columns) is
+        preserved, so the memory profile stays well under the full decode.
+        The pipeline only re-asserts ``use_tiling`` per request, so these
+        construction-time values persist across requests.
+        """
+        vae = getattr(self, "vae", None)
+        if vae is None or not hasattr(vae, "tile_sample_min_height"):
+            return
+        vae.tile_sample_min_height = _VAE_NO_VERTICAL_TILE_MIN_HEIGHT
+        if hasattr(vae, "tile_sample_stride_height"):
+            vae.tile_sample_stride_height = _VAE_NO_VERTICAL_TILE_MIN_HEIGHT
+        logger.info(
+            "[310P] SANA-WM VAE vertical tiling disabled (tile_sample_min_height=%d): "
+            "aclnnReflectionPad3d rejects the 1-row edge tile at 480px height.",
+            _VAE_NO_VERTICAL_TILE_MIN_HEIGHT,
+        )
 
     def _encoder_device(self) -> torch.device:
         return self.device if _encoder_on_npu() else _CPU_DEVICE
