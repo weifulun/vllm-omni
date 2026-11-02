@@ -76,8 +76,8 @@ def test_310p_pipeline_class_derives_from_real_pipeline() -> None:
     change.  Placement semantics are pinned on CPU in test_310p_sdxl.py."""
     from vllm_omni.diffusion.models.sdxl.pipeline_sdxl import StableDiffusionXLPipeline
     from vllm_omni.platforms.npu._310p.patch.sdxl import (
-        _StableDiffusionXL310P,
         _encoder_on_npu,
+        _StableDiffusionXL310P,
         get_sdxl_image_post_process_func,
     )
 
