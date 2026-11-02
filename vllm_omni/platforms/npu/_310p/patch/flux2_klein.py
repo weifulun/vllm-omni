@@ -386,16 +386,38 @@ def _install_vae_tiling_wrap() -> None:
     def _init_with_vae_tiling(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         self._310p_vae_tiling = _maybe_enable_vae_tiling(self.vae)
+        # 310P hardware invariant, enforced at the platform layer: the Qwen3
+        # encoder loads in its on-disk BF16 dtype and the aclnn embedding
+        # kernel rejects it ("Tensor weight not implemented for DT_BFLOAT16"
+        # -> EZ1001 at the first encode).  Cast to FP16 here; chain-1
+        # additionally moves the (now FP16) encoder to host memory.
+        enc_dtype = next(iter(getattr(self.text_encoder, "parameters", lambda: [])()), None)
         if os.environ.get(_ENCODER_CPU_ENV, "0") == "1":
-            self.text_encoder = self.text_encoder.to("cpu")
+            enc = self.text_encoder
+            if isinstance(enc, _CpuPinnedEncoder):
+                enc = enc._m  # the loader proxy was effective (load stayed on host)
+            if enc_dtype is not None and enc_dtype is not torch.float16:
+                logger.warning(
+                    "[310P][flux2-klein] text encoder loaded as %s; casting to "
+                    "float16 (310P is FP16-only)",
+                    enc_dtype,
+                )
+            self.text_encoder = enc.to("cpu", dtype=torch.float16)
             self._310p_encoder_cpu = True
             logger.warning(
-                "[310P][flux2-klein] text encoder pinned to CPU via %s "
-                "(chain-1 OOM downgrade, chip budget 21589 MB); encoder never "
-                "touches the NPU (init cast absorbed), per-request H2D of the "
-                "small prompt embeds only.",
+                "[310P][flux2-klein] text encoder pinned to CPU (fp16) via %s "
+                "(chain-1 OOM downgrade, chip budget 21589 MB); per-request "
+                "H2D of the small prompt embeds only.",
                 _ENCODER_CPU_ENV,
             )
+        elif enc_dtype is not None and enc_dtype is not torch.float16:
+            logger.warning(
+                "[310P][flux2-klein] text encoder loaded as %s; casting to "
+                "float16 in place (310P is FP16-only; aclnn rejects BF16 "
+                "weights)",
+                enc_dtype,
+            )
+            self.text_encoder = self.text_encoder.to(dtype=torch.float16)
 
     Flux2KleinPipeline.__init__ = _init_with_vae_tiling
     _VAE_TILING_WRAPPED = True

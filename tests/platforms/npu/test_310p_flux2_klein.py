@@ -106,9 +106,13 @@ def _make_fake_pipeline_module(monkeypatch: pytest.MonkeyPatch, vae: object) -> 
         def __init__(self):
             # The pipeline __init__ places components on the local chip.
             self.device = "npu"
+            self.dtype = "fp16"
 
-        def to(self, device):
-            self.device = device
+        def to(self, device=None, dtype=None):
+            if device is not None:
+                self.device = device
+            if dtype is not None:
+                self.dtype = dtype
             return self
 
     class FakeFlux2KleinPipeline:
