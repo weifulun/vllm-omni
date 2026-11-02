@@ -198,10 +198,15 @@ def test_entry_applies_all_patches_on_310p(monkeypatch):
     # CPU rope table
     assert getattr(gen_mod, "_310p_rope_cpu_patched", False) is True
     assert gen_mod._precompute_rope_table is patch._precompute_rope_table_cpu
-    # RNG: on a CPU test host the probe must report False -> fallback installed
-    assert patch._NPU_RNG_OK is False
-    assert getattr(torch.Generator, "_310p_cpu_compat", False) is True
-    assert gen_mod._gumbel_sample is patch.gumbel_sample_cpu
+    # RNG: the fallback must be installed exactly when the probe reports the
+    # NPU RNG unusable (probe is host-dependent: CPU test host -> False;
+    # real 310P container with a working torch_npu RNG -> True).
+    rng_ok = patch._NPU_RNG_OK
+    assert rng_ok in (True, False)
+    compat = getattr(torch.Generator, "_310p_cpu_compat", False)
+    assert compat is (not rng_ok)
+    if not rng_ok:
+        assert gen_mod._gumbel_sample is patch.gumbel_sample_cpu
     # idempotency: a second application is a silent no-op
     patch.maybe_apply_omnivoice_310p_patches(_od_config())
 
