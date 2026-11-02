@@ -291,6 +291,27 @@ def test_guard_delegates_non_matching_calls(monkeypatch: pytest.MonkeyPatch) -> 
     assert handles.sampling_calls == []  # random_sample never touched
 
 
+def test_guard_deterministic_sampling_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    handles = _install_nano_fakes(monkeypatch)
+    _isolated_multinomial(monkeypatch)
+    patch = _load_nano_patch(monkeypatch, handles)
+    patch.apply_nano_patches()
+
+    # Force the 310P/NPU decision branch and flip the parity-smoke gate.
+    monkeypatch.setattr(patch, "_multinomial_310p_path", lambda *a: True)
+    monkeypatch.setattr(patch, "_DETERMINISTIC_SAMPLING", True)
+
+    logits = torch.tensor([[0.1, 0.9, 0.0], [0.2, 0.3, 0.5]], dtype=torch.float32)
+    probs = torch.softmax(logits, dim=-1)
+    out = torch.multinomial(probs, 1)
+
+    assert out.shape == (2, 1)  # torch.multinomial contract: (..., num_samples)
+    assert out.dtype == torch.long
+    # Greedy argmax (pure function of the probs): random_sample never touched.
+    assert handles.sampling_calls == []
+    assert torch.equal(out, probs.argmax(dim=-1, keepdim=True).long())
+
+
 def test_guard_preserves_original_semantics_on_delegation(monkeypatch: pytest.MonkeyPatch) -> None:
     handles = _install_nano_fakes(monkeypatch)
     _isolated_multinomial(monkeypatch)

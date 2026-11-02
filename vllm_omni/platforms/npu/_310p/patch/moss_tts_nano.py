@@ -44,6 +44,8 @@ Stage-0 arch (``model_config.model_arch``): ``MossTTSNanoForCausalLM``.
 
 from __future__ import annotations
 
+import os
+
 import torch
 
 from vllm_omni.model_executor.models.moss_tts_nano import modeling_moss_tts_nano
@@ -53,6 +55,15 @@ _RUNTIME_DTYPE = torch.float16
 _NANO_PATCHED = False
 _MULTINOMIAL_GUARD_INSTALLED = False
 _ORIGINAL_MULTINOMIAL = None
+
+# Parity-smoke gate (same convention as the 8B-family patch, commit e9d5ae7ef):
+# the remote LM samples text+audio tokens from the device-global RNG, so two
+# identical runs are *not* bit-identical by model design (910 parity).
+# MOSS_DETERMINISTIC_SAMPLING=1 switches the intercepted multinomial form to
+# greedy argmax (pure function of the probs) so same-input parity checks
+# validate the patch path bit-for-bit. Off by default: production runs keep
+# the stochastic sampling.
+_DETERMINISTIC_SAMPLING = os.environ.get("MOSS_DETERMINISTIC_SAMPLING") == "1"
 
 
 def _cast_module_to_310p_dtype(module) -> None:
@@ -105,12 +116,17 @@ def _install_multinomial_guard() -> None:
 
     def multinomial_310p(input, num_samples=1, replacement=True, *, out=None):
         if _multinomial_310p_path(input, num_samples, replacement, out):
-            from vllm_ascend.sample.sampler import random_sample
-
             flat = input.reshape(-1, input.shape[-1])
-            # ``{}`` = device-global generator: parity with the 910 path,
-            # which also sampled from the device-global RNG state.
-            sampled = random_sample(flat, {})  # (n_rows,) long
+            if _DETERMINISTIC_SAMPLING:
+                # bit-parity smoke mode: greedy argmax (deterministic function
+                # of the probs); see module docstring.
+                sampled = flat.argmax(dim=-1)  # (n_rows,) long
+            else:
+                from vllm_ascend.sample.sampler import random_sample
+
+                # ``{}`` = device-global generator: parity with the 910 path,
+                # which also sampled from the device-global RNG state.
+                sampled = random_sample(flat, {})  # (n_rows,) long
             # torch.multinomial contract: input.shape[:-1] + (num_samples,)
             return sampled.reshape(*input.shape[:-1], 1)
         return _ORIGINAL_MULTINOMIAL(input, num_samples, replacement=replacement, out=out)
