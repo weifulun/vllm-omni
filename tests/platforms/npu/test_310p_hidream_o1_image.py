@@ -180,6 +180,21 @@ def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         maybe_patch_sdpa_math=lambda: None,
     )
 
+    # SDPA backend module - sentinel _sdpa_attention the fp16-softmax swap
+    # (lead-authorized option a, env-gated) replaces when the gate is on.
+    def _sentinel_sdpa_attention(query, key, value, attention_mask, causal, scale):
+        raise AssertionError("sentinel: engine-level math-SDPA must not be called here")
+
+    fake_sdpa_mod = _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.attention.backends.sdpa",
+        _sdpa_attention=_sentinel_sdpa_attention,
+    )
+    # The stub parent package has no __path__, so ``from backends import sdpa``
+    # resolves only through the attribute link:
+    sys.modules["vllm_omni.diffusion.attention.backends"].sdpa = fake_sdpa_mod
+    captured["sdpa_module"] = fake_sdpa_mod
+
     return captured
 
 
@@ -283,6 +298,7 @@ def _apply(monkeypatch: pytest.MonkeyPatch) -> tuple[types.ModuleType, dict[str,
     patch_mod._APPLIED = False
     patch_mod._ATTENTION_GUARD_INSTALLED = False
     patch_mod._PIPELINE_PATCHED = False
+    patch_mod._FP16_SOFTMAX_SWAPPED = False
     patch_mod._install_pipeline_patches()
     return patch_mod, captured
 
@@ -621,3 +637,74 @@ def test_attention_guard_rejects_mindiesd(monkeypatch):
     platform = captured["platform"]
     with pytest.raises(RuntimeError, match="MindIE-SD"):
         platform.get_diffusion_attn_backend_cls("FLASH_ATTN", 128)
+
+
+# ---------------------------------------------------------------------------
+# fp16 in-place softmax capacity swap (lead-authorized option a, env-gated)
+# ---------------------------------------------------------------------------
+
+
+def _fp32_reference(q, k, v, causal: bool, scale, mask):
+    """fp32 reference math identical to the engine-level _math_sdpa."""
+    s = torch.matmul(q.float() * scale, k.float().transpose(-2, -1))
+    if causal:
+        seq = s.shape[-1]
+        s = s.masked_fill(
+            ~torch.ones(seq, seq, dtype=torch.bool).tril(),
+            float("-inf"),
+        )
+    if mask is not None:
+        s = s + mask.float()
+    return torch.matmul(torch.softmax(s, dim=-1), v.float())
+
+
+def test_fp16_softmax_matches_fp32_reference(monkeypatch):
+    mod = _fresh_patch_module(monkeypatch)
+    torch.manual_seed(0)
+    q = torch.randn(1, 4, 96, 16, dtype=torch.float16)
+    k = torch.randn(1, 4, 96, 16, dtype=torch.float16)
+    v = torch.randn(1, 4, 96, 16, dtype=torch.float16)
+    scale = 1.0 / 16**0.5
+    mask = torch.randn(1, 1, 96, 96, dtype=torch.float16)
+    out = mod._math_sdpa_fp16_softmax(q, k, v, mask, causal=False, scale=scale)
+    ref = _fp32_reference(q, k, v, causal=False, scale=scale, mask=mask)
+    assert torch.allclose(out.float(), ref, atol=5e-3, rtol=5e-3)
+
+
+def test_fp16_softmax_causal_and_gqa(monkeypatch):
+    mod = _fresh_patch_module(monkeypatch)
+    torch.manual_seed(1)
+    # GQA: 8 query heads, 4 KV heads.
+    q = torch.randn(1, 8, 64, 16, dtype=torch.float16)
+    k = torch.randn(1, 4, 64, 16, dtype=torch.float16)
+    v = torch.randn(1, 4, 64, 16, dtype=torch.float16)
+    scale = 1.0 / 16**0.5
+    out = mod._math_sdpa_fp16_softmax(q, k, v, None, causal=True, scale=scale)
+    # Reference with KV expanded to query heads.
+    rep = q.shape[1] // k.shape[1]
+    kx = k.repeat_interleave(rep, dim=1)
+    vx = v.repeat_interleave(rep, dim=1)
+    ref = _fp32_reference(q, kx, vx, causal=True, scale=scale, mask=None)
+    assert torch.allclose(out.float(), ref, atol=5e-3, rtol=5e-3)
+    # Attention with causal mask must zero out future keys:
+    assert out[0, 0, 0].abs().sum().item() > 0
+
+
+def test_fp16_softmax_swap_gate_off_by_default(monkeypatch):
+    patch_mod, captured = _apply(monkeypatch)
+    sentinel = captured["sdpa_module"]._sdpa_attention
+    patch_mod.apply_diffusion_310p_patches(_make_od_config())
+    assert captured["sdpa_module"]._sdpa_attention is sentinel
+    assert patch_mod._FP16_SOFTMAX_SWAPPED is False
+
+
+def test_fp16_softmax_swap_env_on_swaps(monkeypatch):
+    patch_mod, captured = _apply(monkeypatch)
+    monkeypatch.setenv("VLLM_OMNI_310P_HIDREAM_FP16_SOFTMAX", "1")
+    patch_mod.apply_diffusion_310p_patches(_make_od_config())
+    swapped = captured["sdpa_module"]._sdpa_attention
+    assert swapped is patch_mod._math_sdpa_fp16_softmax
+    assert getattr(swapped, "_310p_hidream_fp16_softmax", False) is True
+    # Idempotent: a second apply must not re-swap or re-warn.
+    patch_mod.apply_diffusion_310p_patches(_make_od_config())
+    assert captured["sdpa_module"]._sdpa_attention is swapped

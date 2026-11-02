@@ -58,6 +58,7 @@ from __future__ import annotations
 
 import logging
 import math
+import os
 from typing import Any
 
 import torch
@@ -79,6 +80,7 @@ _NUMERICAL_CACHE_BACKENDS = frozenset(
 _APPLIED = False
 _ATTENTION_GUARD_INSTALLED = False
 _PIPELINE_PATCHED = False
+_FP16_SOFTMAX_SWAPPED = False
 
 
 def _pipeline_module():
@@ -460,6 +462,78 @@ def _log_placement_plan(od_config: Any) -> None:
     )
 
 
+def _math_sdpa_fp16_softmax(query, key, value, attention_mask, causal, scale):
+    """Capacity fix for the 21.08 GiB single chip (lead-authorized option a).
+
+    The engine-level ``_math_sdpa`` computes the S x S attention matrix and
+    then runs a torch ``softmax`` that materializes an fp32 S x S buffer
+    (2.03 GiB at 2048x2048, seq ~4113, 32 heads) - the measured OOM point on
+    the FP16 tier (14.17 GiB weights + ~3.4 GiB attention peak > 21.08 GiB).
+    This variant keeps the SAME GQA expansion, score matmul, causal and
+    additive-mask handling, but computes the softmax IN PLACE in fp16 with a
+    max-subtraction for numerical stability, so only the one fp16 S x S
+    score buffer is ever live (peak buffer halved ~1.09 GiB).
+
+    Precision note (MANDATORY in the report): the softmax accumulate drops
+    from fp32 to fp16 - the attention logits here are bounded (~|z| < 5), so
+    fp16 exp is numerically safe and the relative error is ~1e-3.  This only
+    changes the attention-layer accumulate precision on 310P; it is scoped to
+    this model's process and leaves the SDXL/Cosmos lines untouched.
+    """
+    # GQA: expand KV heads to match query heads (mirrors _math_sdpa).
+    if query.shape[1] != key.shape[1]:
+        if query.shape[1] % key.shape[1] != 0:
+            raise ValueError(
+                "GQA requires query heads to be a multiple of KV heads, "
+                f"got q_heads={query.shape[1]} and kv_heads={key.shape[1]}."
+            )
+        repeat_num = query.shape[1] // key.shape[1]
+        key = key.repeat_interleave(repeat_num, dim=1)
+        value = value.repeat_interleave(repeat_num, dim=1)
+
+    if scale is None:
+        scale = 1.0 / query.shape[-1] ** 0.5
+    attn = torch.matmul(query * scale, key.transpose(-2, -1))
+    if causal:
+        seq = attn.shape[-1]
+        causal_mask = torch.ones(seq, seq, dtype=torch.bool, device=attn.device).tril()
+        attn = attn.masked_fill(~causal_mask, float("-inf"))
+    if attention_mask is not None:
+        attn = attn + attention_mask
+
+    # In-place fp16 softmax with max-subtraction (no extra fp32 S x S buffer).
+    row_max = attn.max(dim=-1, keepdim=True).values
+    attn.sub_(row_max)
+    attn.exp_()
+    attn.div_(attn.sum(dim=-1, keepdim=True))
+
+    return torch.matmul(attn, value)
+
+
+def _install_fp16_softmax_swap() -> None:
+    """Swap the SDPA backend's math-attention to the fp16 in-place softmax
+    variant.  Scoped to the HiDream process (each model runs in its own
+    container), so the SDXL/Cosmos engine-level ``_math_sdpa`` is untouched.
+    Idempotent per process."""
+    global _FP16_SOFTMAX_SWAPPED
+    if _FP16_SOFTMAX_SWAPPED:
+        return
+
+    from vllm_omni.diffusion.attention.backends import sdpa as sdpa_backend
+
+    if getattr(sdpa_backend._sdpa_attention, "_310p_hidream_fp16_softmax", False):
+        return
+    swapped = _math_sdpa_fp16_softmax
+    setattr(swapped, "_310p_hidream_fp16_softmax", True)
+    sdpa_backend._sdpa_attention = swapped
+    _FP16_SOFTMAX_SWAPPED = True
+    logger.warning(
+        "[310P][hidream-o1] swapped SDPA math-attention to the in-place fp16 "
+        "softmax variant to avoid the 2.03 GiB fp32 S x S buffer (lead-"
+        "authorized option a; attention accumulate fp32->fp16, ~1e-3)."
+    )
+
+
 def apply_diffusion_310p_patches(od_config: Any) -> None:
     """Apply all HiDream-O1-Image 310P invariants. Idempotent per process.
 
@@ -479,4 +553,6 @@ def apply_diffusion_310p_patches(od_config: Any) -> None:
     _validate_single_chip_parallelism(od_config)
     _install_pipeline_patches()
     _install_attention_guard()
+    if os.environ.get("VLLM_OMNI_310P_HIDREAM_FP16_SOFTMAX", "0") == "1":
+        _install_fp16_softmax_swap()
     _log_placement_plan(od_config)
