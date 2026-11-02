@@ -36,6 +36,13 @@ _DIFFUSION_310P_PATCH_MODULES: dict[str, list[str]] = {
     # also knows the longer ``Cosmos3OmniDiffusersPipeline`` name.
     "Cosmos3OmniDiffusersPipeline": ["vllm_omni.platforms.npu._310p.patch.cosmos3_edge"],
     "Cosmos3OmniPipeline": ["vllm_omni.platforms.npu._310p.patch.cosmos3_edge"],
+    # Kandinsky 6 family (task-30): Kandinsky-6.0-Lite-5s TI2VA (video +
+    # audio).  Lite and Pro share the ``Kandinsky6TI2VAPipeline`` class name;
+    # the 310P invariants (FP16, attention-backend gate, cache disabling,
+    # quantization tier gate, single-chip parallel gate, CPU text encoders,
+    # CPU sigma schedule) are family-agnostic, so one module covers both
+    # checkpoints.
+    "Kandinsky6TI2VAPipeline": ["vllm_omni.platforms.npu._310p.patch.kandinsky6"],
 }
 
 
