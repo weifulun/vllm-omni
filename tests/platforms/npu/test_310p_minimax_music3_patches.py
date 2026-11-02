@@ -611,7 +611,9 @@ def test_talker_embedding_nz_seam(monkeypatch):
     inst.process_weights_after_loading(layer)
     assert not hasattr(layer, "weight_nz"), "the NZ copy must not be created"
     x = torch.randn(2, 4)
-    assert torch.equal(inst.apply(layer, x), F.linear(x, layer.weight))
+    out = inst.apply(layer, x)
+    assert out.device == x.device, "logits must round-trip to the input device"
+    assert torch.equal(out, F.linear(x, layer.weight))
 
 
 def test_embedding_seam_follows_weight_device(monkeypatch):

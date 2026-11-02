@@ -42,9 +42,11 @@ the host with the same seed and the same ``philox`` value stream.
   leave ~2.6 GB on the 21 GB chip, which the prefill profiling run
   consumes before any KV block exists ("No available memory for the cache
   blocks"). The untied embed_tokens and lm_head (2 x 1.64 GB) are
-  therefore offloaded to the host after loading: the lm_head logits
-  already live on the host for the sampler seams, and the embedding moves
-  are batch x 4096 fp16 in each direction.
+  therefore offloaded to the host after loading. The lm_head logits are
+  computed on the host and round-tripped to the NPU, because the
+  talker's ``sample()`` keys all of its row-vector and buffer arithmetic
+  off ``logits.device``; the sampler seams then move them to the host as
+  usual. The embedding moves are batch x 4096 fp16 in each direction.
 
 Everything here is installed only when the platform already confirmed
 ``is_310p()`` and the model architecture is one of the MiniMax Music 3
@@ -178,13 +180,16 @@ def _embed_process_weights_noop_310p(self, layer: nn.Module) -> None:
 
 
 def _embed_apply_plain_310p(self, layer: nn.Module, x: Tensor, bias: Tensor | None = None) -> Tensor:
-    """F.linear on the plain fp16 weight, tracking the weight's device.
+    """F.linear on the plain fp16 weight, with a device round trip.
 
-    After the host offload the weight lives on CPU and the hidden states
-    arrive on the NPU; the logits then stay on the host, which is where the
-    310P sampler seams already run.
+    After the host offload the lm_head weight lives on CPU while the hidden
+    states arrive on the NPU. The logits are computed on the weight's device
+    and returned on the input's: the talker's ``sample()`` arithmetic
+    (row vectors, ``c0_logit_ids``, hidden-state index selects) all key off
+    ``logits.device``, which must stay the NPU. The 310P sampler seams then
+    move the logits to the host as usual (batch x 200000 fp16 per step).
     """
-    return F.linear(x.to(layer.weight.device), layer.weight, bias)
+    return F.linear(x.to(layer.weight.device), layer.weight, bias).to(x.device)
 
 
 def _embed_embedding_310p(self, layer: nn.Module, input_: Tensor) -> Tensor:
@@ -227,13 +232,6 @@ def _offload_talker_embeddings_310p(worker) -> None:
             continue
         module.to("cpu")
         moved.append(f"{name} {tuple(param.shape)} fp16")
-    # The c0 logit-index buffer is consumed inside sample() against the
-    # (now host-side) logits; the other index buffers stay NPU-side with the
-    # forward path.
-    c0_ids = getattr(model, "c0_logit_ids", None)
-    if c0_ids is not None and c0_ids.device.type != "cpu":
-        model.c0_logit_ids = c0_ids.cpu()
-        moved.append("c0_logit_ids int64")
     if moved:
         logger.info(
             "MiniMax Music 3 310P: talker embeddings offloaded to host: %s",
