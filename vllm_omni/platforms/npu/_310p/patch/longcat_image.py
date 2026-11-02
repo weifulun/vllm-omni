@@ -160,7 +160,8 @@ class _LongCatImage310P(LongCatImagePipeline):
       division, VAE-unpack division) is computed on CPU — no RealDiv2
       instances anywhere in the denoise graph (research/012 chain);
     * ``load_weights`` audits the final component dtype/device contract
-      (transformer+VAE FP16 on NPU, encoder FP16 on CPU).
+      (transformer+VAE FP16 on NPU, CPU-pinned encoder FP32 — the CPU FP16
+      GEMM path is unusable on this SoC, see ``load_weights``).
     """
 
     def __init__(self, *, od_config, prefix: str = "") -> None:
@@ -328,6 +329,17 @@ class _LongCatImage310P(LongCatImagePipeline):
         if first_param is not None and first_param.device != self.device:
             self.transformer.to(device=self.device)
             logger.info("[310P][longcat] transformer placed on %s after weight load.", self.device)
+        if self._encoder_device.type == "cpu":
+            # Measured on 125 (aarch64, torch 2.10.0+cpu / torch_npu
+            # 2.10.0.post4): the CPU FP16 GEMM path is ~80x slower than the
+            # FP32 path and does not scale across OpenMP threads at all
+            # (2127x2127x3584 matmul: 95s FP16 vs 1.2s FP32, identical at 1
+            # and 16 threads).  The checkpoint is BF16 and the encoder stays
+            # host-resident, so upcasting to FP32 costs only host RAM (~2x)
+            # and no NPU budget; the FP16 embed hand-off to the NPU is
+            # unchanged (see _encode_prompt).
+            self.text_encoder.to(dtype=torch.float32)
+            logger.info("[310P][longcat] CPU text encoder upcast to float32 (CPU FP16 GEMM path unusable on this SoC).")
         self._310p_audit_components()
         return loaded
 
@@ -356,20 +368,23 @@ class _LongCatImage310P(LongCatImagePipeline):
         ][:5]
         if vae_bad:
             problems.append(f"vae params not ({_RUNTIME_DTYPE} on {self.device}): {vae_bad}")
+        # CPU-pinned encoder runs FP32 (CPU FP16 GEMM is unusable on this
+        # SoC; see load_weights); an NPU-pinned encoder stays runtime FP16.
+        enc_dtype = torch.float32 if self._encoder_device.type == "cpu" else _RUNTIME_DTYPE
         enc_bad = [
             name
             for name, param in self.text_encoder.named_parameters()
-            if param.dtype != _RUNTIME_DTYPE or param.device.type != self._encoder_device.type
+            if param.dtype != enc_dtype or param.device.type != self._encoder_device.type
         ][:5]
         if enc_bad:
-            problems.append(f"text_encoder params not ({_RUNTIME_DTYPE} on {self._encoder_device}): {enc_bad}")
+            problems.append(f"text_encoder params not ({enc_dtype} on {self._encoder_device}): {enc_bad}")
         if problems:
             raise RuntimeError("[310P][longcat] component contract violated after weight load:\n" + "\n".join(problems))
         logger.info(
             "[310P][longcat] component contract OK: transformer/vae %s on %s; text_encoder %s on %s; vae tiling=%s",
             _RUNTIME_DTYPE,
             self.device,
-            _RUNTIME_DTYPE,
+            enc_dtype,
             self._encoder_device,
             self._310p_vae_tiling,
         )

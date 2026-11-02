@@ -546,9 +546,15 @@ def test_load_weights_places_transformer_and_audits(monkeypatch: pytest.MonkeyPa
     # No device move when the transformer already sits on the pipeline device.
     assert pipe.transformer.to_calls == []
     assert loaded == {"transformer.blocks.0.attn.to_q.weight"}
-    # The audit ran (no exception) against the FP16/CPU contract.
+    # The audit ran (no exception) against the runtime contract: FP16 NPU
+    # components, FP32 CPU-pinned encoder (the CPU FP16 GEMM path is unusable
+    # on the 310P SoC, so load_weights upcasts the host encoder).
     for _name, param in pipe.transformer.named_parameters():
         assert param.dtype is torch.float16
+    assert pipe.text_encoder.to_calls[-1] == {"dtype": torch.float32}
+    for _name, param in pipe.text_encoder.named_parameters():
+        assert param.dtype is torch.float32
+        assert param.device.type == "cpu"
 
 
 def test_load_weights_moves_transformer_to_target_device(monkeypatch: pytest.MonkeyPatch) -> None:
