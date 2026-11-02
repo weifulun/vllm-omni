@@ -74,8 +74,10 @@ operator diagnosis only).
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 from functools import partial
 from typing import Any
 
@@ -452,16 +454,21 @@ class _LongCatImage310P(LongCatImagePipeline):
         self._joint_attention_kwargs = joint_attention_kwargs
         self._current_timestep = None
         self._interrupt = False
+        self._310p_timing: list[dict[str, Any]] = []
+        self._310p_timing_step_n = 0
 
         # 2. Define call parameters
         batch_size = len(prompt)
 
         device = self.device
         if enable_prompt_rewrite and prompt is not None:
+            _t0 = time.perf_counter()
             prompt = self.rewire_prompt(prompt if isinstance(prompt, list) else [prompt], device)
+            self._310p_record_timing("rewrite", time.perf_counter() - _t0)
 
         negative_prompt = "" if negative_prompt is None else negative_prompt
 
+        _t0 = time.perf_counter()
         (prompt_embeds, text_ids) = self.encode_prompt(
             prompt=prompt,
             prompt_embeds=prompt_embeds,
@@ -473,6 +480,7 @@ class _LongCatImage310P(LongCatImagePipeline):
                 prompt_embeds=negative_prompt_embeds,
                 num_images_per_prompt=num_images_per_prompt,
             )
+        self._310p_record_timing("encode", time.perf_counter() - _t0)
 
         # 4. Prepare latent variables
         num_channels_latents = 16
@@ -527,6 +535,7 @@ class _LongCatImage310P(LongCatImagePipeline):
                 continue
 
             self._current_timestep = t
+            _t0 = time.perf_counter()
 
             # [310P change 1] per-step timestep scaling on CPU (no on-device
             # RealDiv2 in the denoise graph); expanded to the batch for shape
@@ -565,6 +574,7 @@ class _LongCatImage310P(LongCatImagePipeline):
 
             # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
             latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, self.do_classifier_free_guidance)
+            self._310p_record_timing("step", time.perf_counter() - _t0)
 
         self._current_timestep = None
 
@@ -578,9 +588,12 @@ class _LongCatImage310P(LongCatImagePipeline):
             if latents.dtype != self.vae.dtype:
                 latents = latents.to(dtype=self.vae.dtype)
 
+            _t0 = time.perf_counter()
             image = self.vae.decode(latents, return_dict=False)[0]
+            self._310p_record_timing("vae_decode", time.perf_counter() - _t0)
 
         stage_durations = self.stage_durations if hasattr(self, "stage_durations") else None
+        self._310p_flush_timing()
         return DiffusionOutput(output=image, stage_durations=stage_durations)
 
     @staticmethod
@@ -597,6 +610,35 @@ class _LongCatImage310P(LongCatImagePipeline):
         """
         value = float(t.item()) / 1000.0
         return torch.full((1,), value, dtype=latents_dtype, device=device)
+
+    # ------------------------------------------------------------------
+    # Phase timing (perf runs only).
+    #
+    # The pipeline executes in the engine's worker process, so the probe
+    # runner's in-process monkey-patches never observe the denoise loop.
+    # When ``LONGCAT_310P_TIMING_FILE`` names a path, each ``forward``
+    # appends one JSONL entry per phase (rewrite / encode / one denoise
+    # step / vae_decode) to that file; the runner aggregates the file
+    # after ``generate`` returns.  No env var -> zero overhead.
+    # ------------------------------------------------------------------
+
+    def _310p_record_timing(self, phase: str, seconds: float) -> None:
+        if not os.environ.get("LONGCAT_310P_TIMING_FILE"):
+            return
+        entry: dict[str, Any] = {"phase": phase, "s": round(seconds, 4), "t": time.time()}
+        if phase == "step":
+            entry["n"] = self._310p_timing_step_n
+            self._310p_timing_step_n += 1
+        self._310p_timing.append(entry)
+
+    def _310p_flush_timing(self) -> None:
+        path = os.environ.get("LONGCAT_310P_TIMING_FILE")
+        entries = self._310p_timing
+        if path and entries:
+            with open(path, "a", encoding="utf-8") as f:
+                for entry in entries:
+                    f.write(json.dumps(entry) + "\n")
+            self._310p_timing = []
 
     def cfg_normalize_function(self, noise_pred: torch.Tensor, comb_pred: torch.Tensor, cfg_renorm_min: float = 0.0):
         """CFG renorm override: the norm ratio is computed on CPU (no
