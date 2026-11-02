@@ -181,6 +181,21 @@ def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     # wins via sys.modules overwrite.
     _make_fake_pipeline_module(monkeypatch, _FakeVAE())
 
+    # DiT forward-trap guard (BF16 on-disk weights -> one-shot fp16 cast):
+    # apply() imports the transformer module unconditionally.
+    class FakeDiTModel:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def forward(self, *args, **kwargs):
+            return "dit"
+
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer",
+        Flux2Transformer2DModel=FakeDiTModel,
+    )
+
     captured["platform_module"] = fake_platform_module
     captured["backend_calls"] = calls
     return captured
