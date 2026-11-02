@@ -280,12 +280,86 @@ def _install_attention_guard() -> None:
     _ATTENTION_GUARD_INSTALLED = True
 
 
+_STATIC_WINDOW_GUARD_INSTALLED = False
+
+
+def _install_static_window_guard() -> None:
+    """Compute torch window buffers (hann/hamming/blackman/kaiser/bartlett)
+    on CPU.
+
+    ``torch.hann_window`` and friends build their buffers from cos/arange
+    (and, for ``kaiser_window``, ``torch.special.i0``) math. Under an active
+    ``torch.device(npu)`` context (e.g. the audio-VAE component load in
+    ``_load_components``) torch_npu fails on the chains two ways:
+
+    * ``aclnnInplaceCos`` rejects the int64 ``arange`` intermediate
+      (``AclNN_Parameter_Error EZ1001: Tensor selfRef not implemented for
+      DT_INT64``);
+    * composite ``DispatchStub`` assertions for special ops with no NPU
+      kernel (``missing kernel for npu``, hit via ``kaiser_window``).
+
+    Window buffers are static analytic values, so computing them on CPU and
+    moving the result to the requested (or context-default) device is
+    exact. Installed once per process from ``apply_diffusion_310p_patches``;
+    idempotent via a sentinel attribute on the wrapper.
+    """
+    global _STATIC_WINDOW_GUARD_INSTALLED
+    if _STATIC_WINDOW_GUARD_INSTALLED:
+        return
+
+    window_names = (
+        "hann_window",
+        "hamming_window",
+        "blackman_window",
+        "kaiser_window",
+        "bartlett_window",
+    )
+    if all(
+        getattr(getattr(torch, name), "_310p_window_cpu_guarded", False)
+        for name in window_names
+    ):
+        _STATIC_WINDOW_GUARD_INSTALLED = True
+        return
+
+    for name in window_names:
+        original = getattr(torch, name)
+        if getattr(original, "_310p_window_cpu_guarded", False):
+            continue
+
+        def _make_guarded(orig, _name=name):
+            def _window_cpu_guarded(*args, **kwargs):  # noqa: ANN001
+                device = kwargs.get("device")
+                kwargs["device"] = torch.device("cpu")
+                window = orig(*args, **kwargs)
+                if device is None:
+                    try:
+                        device = torch.get_default_device()
+                    except AttributeError:  # pragma: no cover - very old torch
+                        device = None
+                target = str(device) if device is not None else None
+                if target is not None and not target.startswith("cpu"):
+                    window = window.to(device)
+                return window
+
+            _window_cpu_guarded._310p_window_cpu_guarded = True  # type: ignore[attr-defined]
+            return _window_cpu_guarded
+
+        setattr(torch, name, _make_guarded(original))
+
+    _STATIC_WINDOW_GUARD_INSTALLED = True
+    logger.info(
+        "[310P] Static window buffers (hann/hamming/blackman/kaiser/bartlett) "
+        "pinned to CPU math (aclnnInplaceCos DT_INT64 + special.i0 "
+        "DispatchStub gaps on 310P)."
+    )
+
+
 def _log_placement_plan(od_config: Any) -> None:
     logger.info(
         "[310P][kandinsky6] placement plan: dtype=fp16 attention=TORCH_SDPA "
         "(math decomposition) vae_tiling=built-in(use_tiling=True) "
         "text_encoder=cpu-fp32 text_encoder_2=cpu-fp32 scheduler=cpu-flow-match "
-        "parallel=TP1(sequential CFG) model_class=%s",
+        "parallel=TP1(sequential CFG) windows=cpu-hann model_class=%s",
         getattr(od_config, "model_class_name", None),
     )
 
@@ -309,6 +383,7 @@ def apply_diffusion_310p_patches(od_config: Any) -> None:
     _validate_single_chip_parallelism(od_config)
     _register_pipeline_override()
     _install_attention_guard()
+    _install_static_window_guard()
     _log_placement_plan(od_config)
 
 
@@ -394,6 +469,42 @@ class _Kandinsky6TI2VA310P(Kandinsky6TI2VAPipeline):
                 self.device,
                 torch.float16,
             )
+
+    def prepare_latents(self, *, latent_frames, height, width, dtype, device, seed, sample_audio):  # noqa: ANN001
+        """Pin latent noise to the enforced runtime FP16 dtype.
+
+        The base inference entry resolves the latent dtype as
+        ``getattr(self.transformer, "dtype", torch.bfloat16)``.  The
+        ``Kandinsky6Transformer3DModel`` is a plain ``nn.Module`` with no
+        ``.dtype`` property, so that expression silently falls back to
+        BF16 even though the weights are FP16 (the silent-bf16 trap,
+        COMPARISON POLICY section 1).  310P ``randn``/``normal_`` kernels
+        reject the BF16 intermediate outright (``aclnnInplaceNormal``
+        EZ1001: Self dtype DT_BF16 not support).  Latents must match the
+        FP16 transformer, so sample them in the enforced runtime dtype.
+        """
+        runtime_dtype = getattr(self.od_config, "dtype", None)
+        if not isinstance(runtime_dtype, torch.dtype):
+            runtime_dtype = torch.float16
+        if runtime_dtype != torch.float16:
+            raise RuntimeError(
+                f"310P Kandinsky 6 latents must be FP16, got {runtime_dtype}; "
+                "310P is FP16-only."
+            )
+        logger.info(
+            "[310P] Latent noise sampled in %s (base falls back to bf16 "
+            "via the missing transformer.dtype attribute).",
+            runtime_dtype,
+        )
+        return super().prepare_latents(
+            latent_frames=latent_frames,
+            height=height,
+            width=width,
+            dtype=runtime_dtype,
+            device=device,
+            seed=seed,
+            sample_audio=sample_audio,
+        )
 
     def _load_components(self, od_config, prefix):  # noqa: ANN001
         """Mirror of the base method with per-component load devices.

@@ -34,6 +34,25 @@ logger = logging.getLogger(__name__)
 _PATCHED = False
 
 
+def _sdpa_score_chunk_heads(batch: int, heads: int, seq: int, element_size: int) -> int:
+    """Number of attention heads whose S x S score matrix fits the budget.
+
+    The math decomposition materializes ``batch x chunk x seq x seq`` score
+    tensors; at video-tower shapes (28 heads x 21k tokens) the un-chunked
+    allocation exceeds a 21 GB chip outright (23 GiB observed on the
+    Kandinsky 6 49-frame tier).  Heads are independent, so processing them
+    in bounded chunks is mathematically identical.  Tunables (env):
+    ``VLLM_OMNI_310P_SDPA_HEAD_CHUNK`` (exact chunk) and
+    ``VLLM_OMNI_310P_SDPA_SCORE_BUDGET_MB`` (default 4096).
+    """
+    override = os.environ.get("VLLM_OMNI_310P_SDPA_HEAD_CHUNK")
+    if override:
+        return max(1, min(heads, int(override)))
+    budget_bytes = int(os.environ.get("VLLM_OMNI_310P_SDPA_SCORE_BUDGET_MB", "4096")) * 1024 * 1024
+    per_head_bytes = max(1, batch * seq * seq * element_size)
+    return max(1, min(heads, budget_bytes // per_head_bytes))
+
+
 def _math_sdpa(
     query: torch.Tensor, key: torch.Tensor, value: torch.Tensor, attention_mask, causal: bool, scale
 ) -> torch.Tensor:
@@ -50,15 +69,31 @@ def _math_sdpa(
 
     if scale is None:
         scale = 1.0 / query.shape[-1] ** 0.5
-    attn = torch.matmul(query * scale, key.transpose(-2, -1))
+    q = query * scale
+    heads = q.shape[1]
+    seq = q.shape[-2]
+    chunk = _sdpa_score_chunk_heads(q.shape[0], heads, seq, q.element_size())
+
+    causal_mask = None
     if causal:
-        seq = attn.shape[-1]
-        causal_mask = torch.ones(seq, seq, dtype=torch.bool, device=attn.device).tril()
-        attn = attn.masked_fill(~causal_mask, float("-inf"))
-    if attention_mask is not None:
-        attn = attn + attention_mask
-    attn = torch.softmax(attn, dim=-1)
-    return torch.matmul(attn, value)
+        causal_mask = torch.ones(seq, seq, dtype=torch.bool, device=q.device).tril()
+
+    # Per-head-chunk scores: heads are independent, so chunked
+    # matmul -> [mask/bias] -> softmax -> matmul is value-identical to the
+    # un-chunked form while bounding the S x S allocation to
+    # chunk x seq x seq (the un-chunked allocation OOMs on 310P at
+    # video-tower shapes, task-30 run5).
+    chunks = []
+    for start in range(0, heads, chunk):
+        end = min(start + chunk, heads)
+        attn = torch.matmul(q[:, start:end], key[:, start:end].transpose(-2, -1))
+        if causal_mask is not None:
+            attn = attn.masked_fill(~causal_mask, float("-inf"))
+        if attention_mask is not None:
+            attn = attn + attention_mask
+        attn = torch.softmax(attn, dim=-1)
+        chunks.append(torch.matmul(attn, value[:, start:end]))
+    return torch.cat(chunks, dim=1)
 
 
 def _patch_f_sdpa() -> None:

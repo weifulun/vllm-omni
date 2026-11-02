@@ -294,6 +294,46 @@ def test_cache_backends_are_disabled(monkeypatch: pytest.MonkeyPatch):
 
 
 # ---------------------------------------------------------------------------
+# static window buffer guard (aclnnInplaceCos / DT_INT64, task-30 run 2)
+# ---------------------------------------------------------------------------
+
+
+def test_static_window_guard_pins_windows_to_cpu(monkeypatch: pytest.MonkeyPatch):
+    _install_patch_fakes(monkeypatch)
+    module = _load_kandinsky6_patch(monkeypatch)
+
+    window_names = (
+        "hann_window",
+        "hamming_window",
+        "blackman_window",
+        "kaiser_window",
+        "bartlett_window",
+    )
+    # The guard intentionally monkey-patches torch; restore the original
+    # builders after the test.
+    for name in window_names:
+        monkeypatch.setattr(torch, name, getattr(torch, name))
+
+    original_hann = torch.hann_window
+    module._install_static_window_guard()
+    for name in window_names:
+        assert getattr(getattr(torch, name), "_310p_window_cpu_guarded", False), name
+
+    # Re-install is a no-op (module flag and wrapper sentinel).
+    module._install_static_window_guard()
+    module._STATIC_WINDOW_GUARD_INSTALLED = False
+    module._install_static_window_guard()
+    wrapped = torch.hann_window
+    assert torch.hann_window is wrapped
+
+    # The guard must be value-exact against the stock builder: same buffer,
+    # computed on CPU regardless of any device context.
+    window = torch.hann_window(129)
+    assert window.device.type == "cpu"
+    assert torch.equal(window, original_hann(129))
+
+
+# ---------------------------------------------------------------------------
 # quantization tier gate
 # ---------------------------------------------------------------------------
 
@@ -519,6 +559,136 @@ def _make_fake_pipeline_instance(module, monkeypatch):
     inst.text_encoder = _FakeQwenEncoder()
     inst.text_encoder_2 = _FakeCLIPEncoder()
     return inst
+
+
+# ---------------------------------------------------------------------------
+# SDPA math decomposition: per-head-chunk score buffer (video-tier OOM fix)
+# ---------------------------------------------------------------------------
+
+
+def _load_attention_module(monkeypatch: pytest.MonkeyPatch):
+    patch_dir = _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch"
+    return _load_source_module("attention_310p_under_test", patch_dir / "attention.py")
+
+
+def _naive_sdpa(query, key, value, attention_mask, causal, scale):
+    """Reference full-heads-at-once formula (the un-chunked semantics)."""
+    if query.shape[1] != key.shape[1]:
+        repeat = query.shape[1] // key.shape[1]
+        key = key.repeat_interleave(repeat, dim=1)
+        value = value.repeat_interleave(repeat, dim=1)
+    if scale is None:
+        scale = 1.0 / query.shape[-1] ** 0.5
+    attn = torch.matmul(query * scale, key.transpose(-2, -1))
+    if causal:
+        seq = attn.shape[-1]
+        mask = torch.ones(seq, seq, dtype=torch.bool).tril()
+        attn = attn.masked_fill(~mask, float("-inf"))
+    if attention_mask is not None:
+        attn = attn + attention_mask
+    attn = torch.softmax(attn, dim=-1)
+    return torch.matmul(attn, value)
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+@pytest.mark.parametrize("with_bias", [False, True], ids=["nobias", "bias"])
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16], ids=["fp32", "fp16"])
+def test_math_sdpa_chunked_matches_naive(monkeypatch, causal, with_bias, dtype):
+    monkeypatch.setenv("VLLM_OMNI_310P_SDPA_HEAD_CHUNK", "2")  # force multi-chunk (6 heads -> 2+2+2)
+    attention = _load_attention_module(monkeypatch)
+
+    g = torch.Generator().manual_seed(7)
+    batch, q_heads, kv_heads, seq, dim = 2, 6, 2, 64, 16
+    query = torch.randn(batch, q_heads, seq, dim, generator=g, dtype=dtype)
+    key = torch.randn(batch, kv_heads, seq, dim, generator=g, dtype=dtype)
+    value = torch.randn(batch, kv_heads, seq, dim, generator=g, dtype=dtype)
+    bias = torch.randn(batch, 1, seq, seq, generator=g, dtype=dtype) if with_bias else None
+
+    out = attention._math_sdpa(query, key, value, bias, causal, None)
+    ref = _naive_sdpa(query, key, value, bias, causal, None)
+    assert out.shape == ref.shape
+    atol, rtol = (1e-3, 1e-3) if dtype == torch.float32 else (2e-2, 2e-2)
+    assert torch.allclose(out, ref, atol=atol, rtol=rtol)
+
+
+def test_math_sdpa_chunk_size_env_budget(monkeypatch):
+    attention = _load_attention_module(monkeypatch)
+    monkeypatch.setenv("VLLM_OMNI_310P_SDPA_HEAD_CHUNK", "2")
+    assert attention._sdpa_score_chunk_heads(1, 5, 96, 2) == 2
+    monkeypatch.delenv("VLLM_OMNI_310P_SDPA_HEAD_CHUNK")
+    monkeypatch.setenv("VLLM_OMNI_310P_SDPA_SCORE_BUDGET_MB", "1024")
+    # 1 x 512 x 512 x 2B = 512 KiB per head -> 2048 heads fit in 1 GiB,
+    # capped by the actual head count.
+    assert attention._sdpa_score_chunk_heads(1, 8, 512, 2) == 8
+    monkeypatch.setenv("VLLM_OMNI_310P_SDPA_SCORE_BUDGET_MB", "2")
+    # 2 MiB budget // 512 KiB per head = 4 -> 4 heads.
+    assert attention._sdpa_score_chunk_heads(1, 8, 512, 2) == 4
+    # Tiny budget -> floor to 1 head, never 0 (1 MiB // 512 KiB = 2).
+    monkeypatch.setenv("VLLM_OMNI_310P_SDPA_SCORE_BUDGET_MB", "1")
+    assert attention._sdpa_score_chunk_heads(1, 8, 512, 2) == 2
+
+
+# ---------------------------------------------------------------------------
+# latent dtype pinning (silent-bf16 trap via missing transformer.dtype)
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_latents_pins_noise_to_runtime_fp16(monkeypatch: pytest.MonkeyPatch):
+    _install_patch_fakes(monkeypatch)
+    module = _load_kandinsky6_patch(monkeypatch)
+    inst = _make_fake_pipeline_instance(module, monkeypatch)
+    inst.od_config = SimpleNamespace(dtype=torch.float16)
+
+    # Recorder for the base-class call that the override delegates to.
+    class _Base:
+        def prepare_latents(self, **kwargs):
+            _Base.captured = kwargs
+            return "bundle"
+
+    _Base.captured = None
+    base_cls = type(inst).__mro__[1]
+    monkeypatch.setattr(
+        base_cls, "prepare_latents", _Base.prepare_latents, raising=False
+    )
+
+    out = inst.prepare_latents(
+        latent_frames=13,
+        height=480,
+        width=864,
+        dtype=torch.bfloat16,  # base fallback value; must be overridden
+        device="npu:0",
+        seed=42,
+        sample_audio=True,
+    )
+    assert out == "bundle"
+    assert _Base.captured is not None
+    assert _Base.captured["dtype"] is torch.float16
+    assert _Base.captured["latent_frames"] == 13
+
+
+def test_prepare_latents_rejects_non_fp16_runtime_dtype(monkeypatch: pytest.MonkeyPatch):
+    _install_patch_fakes(monkeypatch)
+    module = _load_kandinsky6_patch(monkeypatch)
+    inst = _make_fake_pipeline_instance(module, monkeypatch)
+    inst.od_config = SimpleNamespace(dtype=torch.bfloat16)
+
+    base_cls = type(inst).__mro__[1]
+    monkeypatch.setattr(
+        base_cls,
+        "prepare_latents",
+        lambda self, **kwargs: "bundle",
+        raising=False,
+    )
+    with pytest.raises(RuntimeError, match="FP16"):
+        inst.prepare_latents(
+            latent_frames=13,
+            height=480,
+            width=864,
+            dtype=torch.bfloat16,
+            device="npu:0",
+            seed=42,
+            sample_audio=True,
+        )
 
 
 def test_encode_prompt_routes_to_encoder_device(monkeypatch: pytest.MonkeyPatch):
