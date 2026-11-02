@@ -515,3 +515,47 @@ def test_patch_apply_replaces_ucpe_rope(monkeypatch: pytest.MonkeyPatch) -> None
 
     fake_ucpe = sys.modules["vllm_omni.diffusion.models.sana_wm.ucpe"]
     assert fake_ucpe._apply_complex_rope is module._ucpe_rope_apply_real
+
+
+def _torch_cross_reference(a: torch.Tensor, b: torch.Tensor, dim: int) -> torch.Tensor:
+    """fp64 component-form cross product (independent reference)."""
+    A = torch.unbind(a.to(torch.float64), dim=dim)
+    B = torch.unbind(b.to(torch.float64), dim=dim)
+    return torch.stack((A[1] * B[2] - A[2] * B[1], A[2] * B[0] - A[0] * B[2], A[0] * B[1] - A[1] * B[0]), dim=dim).to(a.dtype)
+
+
+@pytest.mark.parametrize("dtype", [torch.float16, torch.float32])
+def test_torch_cross_decomp_matches_reference(dtype: torch.dtype, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_310P_SANA_WM_ENCODER_ON_NPU", raising=False)
+    module, _calls = _load_sana_wm_patch(monkeypatch)
+
+    torch.manual_seed(2)
+    a = torch.randn(4, 7, 12, 3, dtype=dtype)
+    b = torch.randn(4, 7, 12, 3, dtype=dtype)
+
+    got = module._torch_cross_310p(a, b, dim=-1)
+    assert got.shape == a.shape
+
+    # ``Tensor.cross`` is a class method the process-wide swap cannot touch.
+    # fp16 (the on-card camera dtype): the decomposition performs the same
+    # multiply/subtract sequence -> bit-exact.  fp32: the CPU kernel
+    # contracts with FMA -> measured up to ~5e-6 rel, bound with 1e-5.
+    real = a.cross(b, dim=-1)
+    rtol = 0.0 if dtype is torch.float16 else 1e-5
+    torch.testing.assert_close(got, real, rtol=rtol, atol=0.0)
+
+    # And against the independent fp64 component form (correctness).
+    ref = _torch_cross_reference(a, b, dim=-1)
+    torch.testing.assert_close(got.float(), ref.float(), rtol=2e-3, atol=1e-3)
+
+
+def test_patch_apply_replaces_torch_cross(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_310P_SANA_WM_ENCODER_ON_NPU", raising=False)
+    module, _calls = _load_sana_wm_patch(monkeypatch)
+    od_config = _make_od_config()
+
+    module.apply_diffusion_310p_patches(od_config)
+
+    assert torch.cross is module._torch_cross_310p
+    # The original binding is retained for restoration/reporting.
+    assert module._ORIGINAL_TORCH_CROSS is not None

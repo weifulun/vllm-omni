@@ -65,6 +65,7 @@ _CPU_DEVICE = torch.device("cpu")
 _ENCODER_ON_NPU_ENV = "VLLM_OMNI_310P_SANA_WM_ENCODER_ON_NPU"
 _SANA_WM_ARCH = "SanaWmPipeline"
 _PATCHED = False
+_ORIGINAL_TORCH_CROSS: Any = None
 
 __all__ = [
     "_SanaWm310P",
@@ -132,6 +133,27 @@ def _rope_apply_real_forward(
     re, im = x[..., 0], x[..., 1]
     out = torch.stack((re * cos - im * sin, re * sin + im * cos), dim=-1)
     return out.flatten(3, 4).permute(0, 1, 3, 2).to(hidden_states.dtype)
+
+
+def _torch_cross_310p(a: torch.Tensor, b: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """310P replacement for ``torch.cross`` (decomposed into mul/sub).
+
+    The CANN 9.1.0 310P op package ships no dynamic-shape kernel JSON for
+    ``aclnnLinalgCross`` (EZ1013: "JSON configuration file of operator
+    aclnnLinalgCross cannot be found" in the dynamic shape scenario), so the
+    NPU call fails at kernel init.  The SANA-WM camera-geometry paths
+    (``camera_control`` Plücker moments, ``ucpe.world_to_ray_mats`` basis
+    build) call it on small per-request tensors; the vector product is
+    decomposed into six muls and three subs (supported fp16/fp32 kernels).
+    ``dim`` is the axis of the 3-vector; both SANA-WM call sites pass -1.
+    """
+    if a.shape[dim] != 3 or b.shape[dim] != 3:
+        raise ValueError("torch.cross inputs must have a size-3 axis")
+    ax, ay, az = torch.unbind(a, dim=dim)
+    bx, by, bz = torch.unbind(b, dim=dim)
+    return torch.stack(
+        (ay * bz - az * by, az * bx - ax * bz, ax * by - ay * bx), dim=dim
+    )
 
 
 def _ucpe_rope_apply_real(
@@ -310,6 +332,15 @@ def apply_diffusion_310p_patches(od_config) -> None:
     # real-arithmetic version; `_prepare_ray_apply_fns` resolves the global
     # by name at call time, so every `partial(...)` picks up the replacement.
     _sana_wm_ucpe._apply_complex_rope = _ucpe_rope_apply_real
+
+    # aclnnLinalgCross has no 310P dynamic-shape kernel (EZ1013); the camera
+    # geometry (Plücker moments + ray basis) calls torch.cross per request.
+    # Swap it process-wide for the mul/sub decomposition (same pattern as
+    # the attention.py SDPA swap; only SANA-WM loads in this process).
+    global _ORIGINAL_TORCH_CROSS
+    if _ORIGINAL_TORCH_CROSS is None:
+        _ORIGINAL_TORCH_CROSS = torch.cross  # save before the swap
+    torch.cross = _torch_cross_310p  # idempotent re-assignment
 
     from vllm_omni.diffusion.registry import register_diffusion_model
 
