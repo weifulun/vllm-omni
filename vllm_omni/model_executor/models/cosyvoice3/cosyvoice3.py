@@ -571,9 +571,23 @@ class CosyVoice3MultiModalProcessor(OmniMultiModalProcessor[CosyVoice3MultiModal
             ) from e
 
         model = _s3.load_model("speech_tokenizer_v3_25hz")
-        device = current_omni_platform.get_torch_device()
+        device = torch.device(current_omni_platform.get_torch_device())
+        # 310P's aclnn backend has no complex-dtype kernels, and the v3
+        # tokenizer's RoPE buffer (``freqs_cis``) is complex64: running it on
+        # the NPU raises "OPS feature not supported".  The encoder is small
+        # (one pass per reference audio), so fall back to CPU on 310P in
+        # every process — both the AR worker and the main-process
+        # InputProcessor run this path.
+        if device.type != "cpu":
+            try:
+                from vllm_omni.platforms.npu._310p import is_310p
+
+                if is_310p():
+                    device = torch.device("cpu")
+            except Exception:
+                pass
         model = model.to(device).eval()
-        return (model, _s3, device)
+        return (model, _s3, str(device))
 
     _s3_batcher: "_SpeechTokenBatcher | None" = None
 
