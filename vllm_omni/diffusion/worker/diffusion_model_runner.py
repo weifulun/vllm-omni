@@ -311,7 +311,6 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                     don't require default weights.
             custom_pipeline_name: Optional custom pipeline class name to use.
         """
-
         if load_format == "dummy":
             return
 
@@ -334,6 +333,19 @@ class DiffusionModelRunner(DiffusionStagePayloadMixin):
                 "AllGather across data-parallel ranks; disable the cache or use "
                 "rank-local text_encoder transfer."
             )
+
+        # 310P model specialization (task-16): applied directly here as well
+        # -- self-gated (off 310P / other model classes) and idempotent.  The
+        # platform hook below dispatches through the platform object resolved
+        # at import time; some runner paths resolve a base no-op there, so the
+        # direct call guarantees the 310P factories (encoder placement, RoPE,
+        # manual SDPA, VAE tiling) are installed before component
+        # construction regardless of hook dispatch.
+        from vllm_omni.platforms.npu._310p.patch.qwen_image_2_1 import (
+            maybe_apply_diffusion_310p_patches,
+        )
+
+        maybe_apply_diffusion_310p_patches(self.od_config)
 
         current_omni_platform.init_diffusion_model_runner_runtime(
             vllm_config=self.vllm_config,

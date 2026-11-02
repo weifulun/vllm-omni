@@ -707,6 +707,18 @@ class DiffusersPipelineLoader(HWRLoaderMixin):
         device: torch.device | None = None,
     ) -> nn.Module:
         """Load a model with the given configurations."""
+        # 310P model specialization (task-16 Qwen-Image-2.1): self-gated
+        # (no-op off 310P / other model classes) and idempotent.  Applied at
+        # the loader chokepoint in addition to the model-runner/platform
+        # hooks so the specialized component factories (encoder placement,
+        # RoPE, manual SDPA, VAE tiling) are installed before the pipeline
+        # constructs its components on every load path.
+        from vllm_omni.platforms.npu._310p.patch.qwen_image_2_1 import (
+            maybe_apply_diffusion_310p_patches,
+        )
+
+        maybe_apply_diffusion_310p_patches(self.od_config)
+
         self.host_weight_plan = None
         self._hwr_state = None
         self._last_load_request = {
