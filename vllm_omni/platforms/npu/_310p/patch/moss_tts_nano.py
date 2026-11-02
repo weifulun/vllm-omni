@@ -130,7 +130,9 @@ class _MossTTSNano310P(modeling_moss_tts_nano.MossTTSNanoForGeneration):
     """
 
     def __init__(self, vllm_config, prefix: str = "") -> None:
-        super().__init__(vllm_config, prefix=prefix)
+        # Upstream __init__ is keyword-only (``def __init__(self, *, vllm_config, prefix)``);
+        # a positional super() call raises TypeError at engine init.
+        super().__init__(vllm_config=vllm_config, prefix=prefix)
         _cast_module_to_310p_dtype(self._lm)
         _cast_module_to_310p_dtype(self._audio_tokenizer)
 
