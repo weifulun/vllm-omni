@@ -34,7 +34,16 @@ Against the 8B 310P skeleton this patch therefore:
   intercepts the exact single-sample/replacement/NPU-tensor form the remote
   LM uses and rewrites it to ``random_sample`` (Gumbel-max + NPU exponential
   generator, device-global RNG — parity with the 910 path); every other
-  call shape delegates to the original implementation untouched.
+  call shape delegates to the original implementation untouched.  Under
+   ``MOSS_DETERMINISTIC_SAMPLING=1`` (POLICY §1 acceptance gate, off by
+   default) the single-sample path returns the argmax index instead of
+   drawing from the device-global RNG, making bit-parity runs a
+   deterministic acceptance condition.
+* **trims (TP1)**: the EH0012 ``empty_cache`` double no-op from the 8B
+  branch (``aee740b99``) is intentionally NOT installed here.  Nano runs
+  TP1 single-worker on one chip; the EH0012 allocator-poison hazard was a
+  multi-worker (TP2) phenomenon and the TP1 real-device engine inits run
+  without it.  Diff vs the 8B branch is documented in the 310P report.
 
 Generic model modules stay unchanged; registration swaps the class only when
 the 310P platform applies the patch (see ``_310p/patch/__init__.py``).
@@ -43,6 +52,8 @@ Stage-0 arch (``model_config.model_arch``): ``MossTTSNanoForCausalLM``.
 """
 
 from __future__ import annotations
+
+import os
 
 import torch
 
@@ -78,6 +89,21 @@ def _cast_module_to_310p_dtype(module) -> None:
     _cast_module_to_dtype(module, _RUNTIME_DTYPE)
 
 
+def _deterministic_sampling_enabled() -> bool:
+    """``MOSS_DETERMINISTIC_SAMPLING=1`` -> argmax acceptance gate (POLICY §1).
+
+    The Nano remote LM samples audio/text codes with a device-global RNG
+    (``random_sample(probs, {})`` on 310P; ``multinomial`` on 910) — an
+    *upstream design parity*, not a 310P defect.  Under this gate the
+    single-sample path returns the argmax (deterministic) instead of drawing
+    from the device RNG, so bit-parity runs can be taken as an acceptance
+    condition.  Off by default: production sampling is unchanged.  Read at
+    call time so contract tests can toggle it via ``monkeypatch.setenv``
+    without re-importing the module.
+    """
+    return os.environ.get("MOSS_DETERMINISTIC_SAMPLING") == "1"
+
+
 def _multinomial_310p_path(input: torch.Tensor, num_samples: int, replacement: bool, out) -> bool:
     """Whether this ``torch.multinomial`` call should use the 310P rewrite.
 
@@ -110,9 +136,13 @@ def _install_multinomial_guard() -> None:
 
     def multinomial_310p(input, num_samples=1, replacement=True, *, out=None):
         if _multinomial_310p_path(input, num_samples, replacement, out):
+            flat = input.reshape(-1, input.shape[-1])
+            if _deterministic_sampling_enabled():
+                # Deterministic acceptance gate (POLICY §1): argmax index.
+                # torch.multinomial contract: input.shape[:-1] + (num_samples,)
+                return flat.argmax(dim=-1).reshape(*input.shape[:-1], 1)
             from vllm_ascend.sample.sampler import random_sample
 
-            flat = input.reshape(-1, input.shape[-1])
             # ``{}`` = device-global generator: parity with the 910 path,
             # which also sampled from the device-global RNG state.
             sampled = random_sample(flat, {})  # (n_rows,) long

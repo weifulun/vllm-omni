@@ -304,3 +304,27 @@ def test_guard_preserves_original_semantics_on_delegation(monkeypatch: pytest.Mo
     torch.manual_seed(0)
     expected = original(probs, 1, replacement=True)
     assert torch.equal(delegated, expected)
+
+
+def test_guard_uses_argmax_under_deterministic_gate(monkeypatch: pytest.MonkeyPatch) -> None:
+    """MOSS_DETERMINISTIC_SAMPLING=1 -> argmax, RNG path untouched (POLICY §1).
+
+    The device-global-RNG sampling is upstream design (910 parity), so
+    bit-parity is an acceptance condition only under the deterministic
+    gate; production sampling (gate off) must keep the random_sample path.
+    """
+    handles = _install_nano_fakes(monkeypatch)
+    _isolated_multinomial(monkeypatch)
+    patch = _load_nano_patch(monkeypatch, handles)
+    patch.apply_nano_patches()
+
+    monkeypatch.setattr(patch, "_multinomial_310p_path", lambda *a: True)
+    monkeypatch.setenv("MOSS_DETERMINISTIC_SAMPLING", "1")
+
+    probs = torch.softmax(torch.randn(3, 11), dim=-1)
+    out = torch.multinomial(probs, 1)
+
+    assert out.shape == (3, 1)  # torch.multinomial contract preserved
+    assert out.dtype == torch.long
+    assert torch.equal(out, probs.argmax(dim=-1).reshape(3, 1))  # deterministic
+    assert handles.sampling_calls == []  # random_sample never touched
