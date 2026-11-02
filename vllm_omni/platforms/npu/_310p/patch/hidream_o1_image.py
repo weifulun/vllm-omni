@@ -23,9 +23,12 @@ tag 5917730 pipeline/transformer sources):
   one 21589 MB 310P3 chip is ~15.4 GB (decimal) - inside the single-chip
   budget (research/014 survey line: 8.8 B / 17.6 GB FP16 edge).
 - The pipeline hard-asserts BF16 (``_validate_static_config`` raises unless
-  ``od_config.dtype == bfloat16``).  310P is FP16-only (POLICY section 2,
-  ENV-PRECHECK P1-5): this patch pins ``od_config.dtype=float16`` and widens
-  the gate to accept it; BF16 stays rejected.
+  ``od_config.dtype == bfloat16``), and the engine itself sets
+  ``od_config.dtype=bfloat16`` by default.  310P is FP16-only (POLICY section
+  2, ENV-PRECHECK P1-5) with no BF16 hardware at all: this patch COERCES the
+  od_config dtype (None/bfloat16 -> float16) before the pipeline is built and
+  widens the gate to accept float16 (the gate still rejects a bf16
+  ``self.dtype`` as the hardware boundary).
 - ``FlowUniPCMultistepScheduler`` is built with ``device=self.device``
   (NPU): the per-step sigma division (``timesteps/1000``), the ``v =
   (x_pred - z) / sigma`` velocity math and ``sched.step`` (fp32 log/exp/div
@@ -82,20 +85,33 @@ def _pipeline_module():
 
 
 def _pin_fp16(od_config: Any) -> None:
-    """310P is FP16-only: pin the diffusion dtype to float16, reject BF16.
+    """310P is FP16-only: coerce the diffusion dtype to float16.
 
-    The HiDream recipe passes no dtype (the pipeline would silently default
-    to bfloat16, which 310P rejects at the hardware level, ENV-PRECHECK
-    P1-5), so ``None`` is pinned to float16 here rather than rejected -
-    explicit BF16 requests are rejected per POLICY section 2.
+    The engine sets ``od_config.dtype`` to ``torch.bfloat16`` by default (the
+    HiDream recipe passes no explicit dtype), and 310P has no BF16 hardware
+    at all (hardware-level EZ1001 reject, ENV-PRECHECK P1-5).  FP16 is the
+    POLICY section-2 primary tier and the ONLY half precision this card can
+    run, so a BF16 dtype - whether the engine default or an explicit request
+    - is COERCED to float16 rather than rejected (rejecting would make the
+    default config impossible to launch on 310P).  Non-half dtypes (fp32...)
+    are still rejected.  The pipeline-level gate keeps rejecting
+    ``self.dtype == bfloat16`` as the hardware boundary.
     """
     dtype = getattr(od_config, "dtype", None)
     if dtype is None:
         od_config.dtype = torch.float16
         logger.warning(
-            "[310P][hidream-o1] od_config.dtype was None (engine default bf16); "
+            "[310P][hidream-o1] od_config.dtype was None (engine default); "
             "pinned to float16 (310P is FP16-only, ENV-PRECHECK P1-5, "
             "COMPARISON-POLICY.md section 2)."
+        )
+        return
+    if dtype == torch.bfloat16:
+        od_config.dtype = torch.float16
+        logger.warning(
+            "[310P][hidream-o1] od_config.dtype was bfloat16 (engine default); "
+            "COERCED to float16 - 310P has no BF16 hardware (ENV-PRECHECK "
+            "P1-5, COMPARISON-POLICY.md section 2)."
         )
         return
     if dtype == torch.float16:
@@ -103,7 +119,7 @@ def _pin_fp16(od_config: Any) -> None:
     raise RuntimeError(
         f"310P diffusion requires FP16 (od_config.dtype={dtype!r}): 310P has "
         "no BF16 (hardware-level EZ1001 reject) and FP16 is the POLICY "
-        "section-2 primary tier. Pass float16 as the diffusion dtype."
+        "section-2 primary tier."
     )
 
 

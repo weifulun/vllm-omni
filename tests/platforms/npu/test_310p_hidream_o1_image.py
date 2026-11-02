@@ -306,9 +306,18 @@ def test_pin_fp16_float16_passthrough(monkeypatch):
     assert cfg.dtype == torch.float16
 
 
-def test_pin_fp16_bf16_rejected(monkeypatch):
+def test_pin_fp16_bf16_coerced(monkeypatch):
+    """bf16 (the engine default on 310P, where no BF16 hardware exists) must
+    be coerced to fp16, not rejected."""
     mod = _fresh_patch_module(monkeypatch)
     cfg = _make_od_config(dtype=torch.bfloat16)
+    mod._pin_fp16(cfg)
+    assert cfg.dtype == torch.float16
+
+
+def test_pin_fp16_fp32_rejected(monkeypatch):
+    mod = _fresh_patch_module(monkeypatch)
+    cfg = _make_od_config(dtype=torch.float32)
     with pytest.raises(RuntimeError, match="FP16"):
         mod._pin_fp16(cfg)
 
