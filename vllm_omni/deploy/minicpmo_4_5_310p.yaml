@@ -96,6 +96,15 @@ platforms:
         # 1 GiB like stage 1; the code2wav KV is a small formality (the real
         # streaming state lives in the flow/HiFT runtime caches).
         kv_cache_memory_bytes: 1073741824
+        # Real-device (128 C1, 2026-11-03, boot10-14): the base 910B1 overlay
+        # inherits gpu_memory_utilization: 0.22 at this platform layer, which
+        # sizes the stage-2 pool to ~4.5 GiB on chip1 (measured 4.53 GiB at
+        # OOM: 14.84 TP-rank pool + 4.53 stage-2 pool + ~0.4 flow cache >
+        # 20.51 GiB). Stage 2's real memory is weights (~0.7 GiB) + runtime
+        # flow/HiFT state; its KV is a small formality. 0.15 cuts the pool to
+        # ~3.1 GiB and leaves chip1 ~1.8 GiB of headroom for the per-request
+        # fp32 estimator attention cache.
+        gpu_memory_utilization: 0.15
         additional_config:
           code2wav_enable_npu_graph: false
           # NOTE: token2wav_float16 must live in the connectors section extra,
