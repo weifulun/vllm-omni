@@ -343,6 +343,39 @@ def _install_loader_cpu_build() -> None:
         loader_cls._init_from_load_format = _init_from_load_format_with_int8_fix  # type: ignore[method-assign]
         loader_cls._310p_int8_load_device_patched = True  # type: ignore[attr-defined]
 
+    if loader_cls is not None:
+        # Post-load placement fix (companion to the CPU construction pin):
+        # the non-HSDP "default" load path performs NO whole-model
+        # ``model.to(target_device)`` - upstream it is unnecessary because
+        # construction happens under ``with target_device:`` (every param
+        # starts on the accelerator).  Under the CPU pin, every NON-INT8
+        # param (token/lm_head embeddings, the whole NEOVision tower, VAE,
+        # over-wide fp16 fallback linears, build-time buffers) stays host
+        # resident and the first forward dies with "indices is on npu:0,
+        # different from other tensors on cpu" (vocab_parallel_embedding).
+        # Restore the invariant: move what is still on host right before the
+        # quantization sweep (which then runs exactly as upstream).  INT8
+        # layers are already NPU-resident via the flipped _load_device.
+        orig_process_after = loader_cls._process_weights_after_loading
+
+        def _process_after_with_placement(self: Any, model: Any, target_device: Any) -> None:
+            if getattr(target_device, "type", None) == "npu":
+                n_cpu = sum(1 for param in model.parameters() if param.device.type == "cpu")
+                if n_cpu:
+                    model.to(target_device)
+                    logger.info(
+                        "[310P][sensenova-u1.5] moved %d host-resident params to %s "
+                        "post-load (CPU construction pin; INT8 layers already "
+                        "accelerator-resident)",
+                        n_cpu,
+                        target_device,
+                    )
+            orig_process_after(self, model, target_device)
+
+        if not getattr(loader_cls, "_310p_placement_patched", False):
+            loader_cls._process_weights_after_loading = _process_after_with_placement  # type: ignore[method-assign]
+            loader_cls._310p_placement_patched = True  # type: ignore[attr-defined]
+
     _LOADER_CPU_BUILD_INSTALLED = True
 
 

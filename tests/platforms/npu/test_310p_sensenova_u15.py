@@ -135,6 +135,21 @@ class _DeviceLike:
         return self._spec
 
 
+class _PlacementModel:
+    """nn.Module stand-in: real CPU/meta params, recording .to() calls."""
+
+    def __init__(self, params: list):
+        self._params = params
+        self.moved_to = None
+
+    def parameters(self):
+        return iter(self._params)
+
+    def to(self, device):
+        self.moved_to = str(device)
+        return self
+
+
 def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Install the fake modules sensenova_u15.py imports lazily."""
     captured: dict[str, object] = {}
@@ -490,6 +505,33 @@ def test_prepare_input_images_follows_serving_dtype_not_bf16(monkeypatch: pytest
     assert pixel_values.device == torch.device("cpu")
     assert grid_hw.dtype == torch.long
     assert grid_hw.shape == (1, 2)
+
+
+def test_post_load_placement_moves_host_params_to_npu(monkeypatch: pytest.MonkeyPatch):
+    """310P real-device evidence: after load the vision tower's embedding
+    died with 'indices is on npu:0, different from other tensors on cpu' -
+    the non-HSDP default load path never runs a whole-model .to(target)
+    (upstream builds under with target_device:), so the CPU construction
+    pin strands every non-INT8 param on host.  The placement wrap must move
+    host-resident params before the quantization sweep, and skip when
+    nothing is on host."""
+    captured = _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+    for env_name in ("_VISION_CPU_ENV", "_MOTGEN_CPU_ENV"):
+        monkeypatch.delenv(getattr(module, env_name), raising=False)
+    module.apply_diffusion_310p_patches(_make_od_config(quantization_config=_int8_config()))
+
+    loader_cls = captured["loader_module"].DiffusersPipelineLoader
+    cpu_param = torch.tensor([1.0])
+    model = _PlacementModel([cpu_param, cpu_param.clone()])
+    loader_cls._process_weights_after_loading(object(), model, _DeviceLike("npu:0"))
+    assert model.moved_to == "npu:0"
+    assert captured["post_load_calls"] and captured["post_load_calls"][-1][2] == "npu:0"
+
+    meta_param = torch.empty(2, device="meta")
+    dry_model = _PlacementModel([meta_param])
+    loader_cls._process_weights_after_loading(object(), dry_model, _DeviceLike("npu:0"))
+    assert dry_model.moved_to is None  # nothing on host -> no move
 
 
 def test_vision_pins_run_after_weight_load(monkeypatch: pytest.MonkeyPatch):
