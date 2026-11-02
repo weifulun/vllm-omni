@@ -26,7 +26,7 @@ stages:
   - stage_id: 0
     tensor_parallel_size: 2
     devices: "0,1"
-    gpu_memory_utilization: 0.72
+    gpu_memory_utilization: 0.78
     max_model_len: 8192
     # Real-device first boot (128 C1, 2026-11-02): the base PIECEWISE
     # compiled decode fails on 310P — aclnnApplyRotaryPosEmbV2 gets a null
