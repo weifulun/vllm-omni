@@ -637,7 +637,7 @@ def _resampler_push_310p(self: _dav_module.StreamingResampler, chunks, *, flush:
     if self._context is not None:
         self._context = self._context.to("cpu")
 
-    parts = [chunk for chunk in chunks if chunk.numel()]
+    parts = [chunk.to("cpu") for chunk in chunks if chunk.numel()]
     if self._pending is not None:
         parts.insert(0, self._pending)
         self._pending = None
@@ -645,7 +645,6 @@ def _resampler_push_310p(self: _dav_module.StreamingResampler, chunks, *, flush:
         return self._empty(self._context)
 
     buffered = torch.cat(parts, dim=-1) if len(parts) > 1 else parts[0]
-    buffered = buffered.cpu()
     total = int(buffered.shape[-1])
     if flush:
         emit_len, lookahead = total, 0
