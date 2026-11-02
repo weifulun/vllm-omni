@@ -764,6 +764,18 @@ def _build_310p_pipeline_cls():
     """Materialize the 310P subclass at apply time (the heavy diffusion
     imports stay out of module import so contract tests run CPU-only)."""
     from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import SenseNovaU1Pipeline
+    from vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer import (
+        SenseNovaU1ForCausalLM,
+    )
+
+    # The MoT LM declares no _layerwise_offload_blocks_attrs upstream, so the
+    # layerwise offload backend finds no streamable blocks and falls back to
+    # component.module.to(device) on the WHOLE 17.53B LM (35.07 GB) - an
+    # immediate single-chip OOM ("Tried to allocate 194 MiB; 19.51 GiB in
+    # use", 127 C4).  Declare the 42-layer MoT stack as the block list so the
+    # backend streams one layer at a time (weights resident on host).
+    if not getattr(SenseNovaU1ForCausalLM, "_layerwise_offload_blocks_attrs", None):
+        SenseNovaU1ForCausalLM._layerwise_offload_blocks_attrs = ["model.layers"]
 
     cls = type(
         "_SenseNovaU15Pipeline310P",

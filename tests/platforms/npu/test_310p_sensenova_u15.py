@@ -235,6 +235,18 @@ def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     )
     captured["fake_pipeline_module"] = sys.modules["vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1"]
 
+    # Fake LM transformer module: the patch declares
+    # _layerwise_offload_blocks_attrs on this class at apply time.
+    class FakeSenseNovaU1ForCausalLM:
+        pass
+
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.sensenova_u1.sensenova_u1_transformer",
+        SenseNovaU1ForCausalLM=FakeSenseNovaU1ForCausalLM,
+    )
+    captured["fake_lm_cls"] = FakeSenseNovaU1ForCausalLM
+
     # Fake loader module: initialize_model records the default device it is
     # called under; DiffusersPipelineLoader tracks post-load placement calls.
     devices_seen: list[str] = []
@@ -431,6 +443,23 @@ def test_single_chip_fp16_with_layerwise_offload_is_accepted(monkeypatch: pytest
     od_config.enable_layerwise_offload = True
     module.apply_diffusion_310p_patches(od_config)
     assert module._APPLIED is True
+
+
+def test_lm_block_stack_declared_for_layerwise_offload(monkeypatch: pytest.MonkeyPatch):
+    """Without _layerwise_offload_blocks_attrs the offload backend finds no
+    streamable blocks and moves the WHOLE 17.53B LM to the chip
+    (component_utils.iter_streamable_dits fallback: component.module.to(device))
+    - an immediate single-chip OOM on 127 C4.  The patch must declare the
+    42-layer MoT stack so the backend streams one layer at a time."""
+    captured = _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+
+    od_config = _make_od_config(tp=1, sp=None)
+    od_config.enable_layerwise_offload = True
+    module.apply_diffusion_310p_patches(od_config)
+
+    lm_cls = captured["fake_lm_cls"]
+    assert list(lm_cls._layerwise_offload_blocks_attrs) == ["model.layers"]
 
 
 def test_multi_chip_without_quant_is_not_patched_rejected(monkeypatch: pytest.MonkeyPatch):
