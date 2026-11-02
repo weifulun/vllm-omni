@@ -79,6 +79,10 @@ def apply_diffusion_310p_patches(od_config) -> None:
 
     _maybe_skip_startup_warmup()
 
+    from vllm_omni.platforms.npu._310p.patch.attention import maybe_patch_sdpa_math
+
+    maybe_patch_sdpa_math()
+
     model_arch = getattr(od_config, "model_class_name", None)
     module_names = _DIFFUSION_310P_PATCH_MODULES.get(model_arch)
     if not module_names:
