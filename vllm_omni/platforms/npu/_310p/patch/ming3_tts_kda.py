@@ -343,6 +343,54 @@ def make_conv_swaps() -> tuple[Any, Any]:
     return _conv_fn, _conv_update
 
 
+def rms_norm_gated_310p(
+    x: torch.Tensor,
+    g: torch.Tensor,
+    weight: torch.Tensor | None,
+    bias: torch.Tensor | None,
+    activation: str = "swish",
+    residual: torch.Tensor | None = None,
+    prenorm: bool = False,
+    residual_in_fp32: bool = False,
+    eps: float = 1e-6,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Pure-torch stand-in for the TRITON ``rms_norm_gated`` op.
+
+    Mirrors ``vllm_ascend/ops/triton/kda/kda.py::layer_norm_gated_fwd_kernel``
+    (IS_RMS_NORM path, fp32 compute, cast back to the input dtype):
+
+        y = x * rsqrt(mean(x**2) + eps) * weight + bias
+        y = y * silu(g)          (activation "swish"/"silu")
+        y = y * sigmoid(g)       (activation "sigmoid")
+
+    The BailingMoeV3 KDA block calls ``norm_op(x, z)`` with no residual
+    (``AscendFusedRMSNormGated.forward_oot``); unsupported variants are
+    rejected loudly rather than approximated.
+    """
+    if residual is not None or prenorm or residual_in_fp32:
+        raise RuntimeError(
+            "Ming3 310P rms_norm_gated torch path does not support "
+            f"residual={residual is not None}, prenorm={prenorm}, "
+            f"residual_in_fp32={residual_in_fp32}"
+        )
+    xf = x.float()
+    y = xf * torch.rsqrt(xf.pow(2).mean(dim=-1, keepdim=True) + eps)
+    if weight is not None:
+        y = y * weight
+    if bias is not None:
+        y = y + bias
+    gg = g.float()
+    if activation in ("swish", "silu"):
+        y = y * gg * torch.sigmoid(gg)
+    else:
+        y = y * torch.sigmoid(gg)
+    if out is not None:
+        out.copy_(y.to(out.dtype))
+        return out
+    return y.to(x.dtype)
+
+
 # ---------------------------------------------------------------------------
 # Install
 # ---------------------------------------------------------------------------
@@ -399,6 +447,22 @@ def install_kda_310p_ops() -> None:
                 setattr(fla_kda, name, fn)
     except Exception as exc:  # noqa: BLE001 - best effort sync
         logger.debug("Ming3 310P KDA patch: FLA module sync skipped (%s)", exc)
+
+    # The KDA block's gated RMS-norm is a TRITON op too:
+    # ``AscendFusedRMSNormGated.forward_oot`` calls the module-global
+    # ``rms_norm_gated`` in ``vllm_ascend.ops.layernorm``.  Rebind that
+    # namespace (and the kernel module it imported from) so both import
+    # sites see the torch path.
+    try:
+        import vllm_ascend.ops.layernorm as _la
+        import vllm_ascend.ops.triton.kda.kda as _kda_triton
+
+        if hasattr(_la, "rms_norm_gated"):
+            _la.rms_norm_gated = rms_norm_gated_310p
+        if hasattr(_kda_triton, "rms_norm_gated"):
+            _kda_triton.rms_norm_gated = rms_norm_gated_310p
+    except Exception as exc:  # noqa: BLE001 - best effort rebind
+        logger.warning("Ming3 310P KDA patch: rms_norm_gated rebind skipped (%s)", exc)
 
     _INSTALLED = True
     logger.info("Ming3 310P KDA torch ops installed on bailing_moe_v3")

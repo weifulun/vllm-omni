@@ -413,6 +413,16 @@ class TestInstallKdaOps:
             "vllm_ascend.ops.causal_conv1d",
         )
         monkeypatch.setitem(sys.modules, "vllm_ascend.ops.causal_conv1d", conv_mod)
+        # The gated RMS-norm rebind touches these two namespaces at install.
+        la_mod = types.ModuleType("vllm_ascend.ops.layernorm")
+        la_mod.rms_norm_gated = lambda *a, **k: None
+        _install_package_chain(
+            monkeypatch, "vllm_ascend.ops.triton", "vllm_ascend.ops.triton.kda"
+        )
+        kda_triton_mod = types.ModuleType("vllm_ascend.ops.triton.kda.kda")
+        kda_triton_mod.rms_norm_gated = lambda *a, **k: None
+        monkeypatch.setitem(sys.modules, "vllm_ascend.ops.layernorm", la_mod)
+        monkeypatch.setitem(sys.modules, "vllm_ascend.ops.triton.kda.kda", kda_triton_mod)
         return _load_kda_module(monkeypatch)
 
     def test_rebind_all_six_ops(self, monkeypatch: pytest.MonkeyPatch):
@@ -429,6 +439,42 @@ class TestInstallKdaOps:
         assert getattr(bm3, "fused_recurrent_kda_fwd") is kda.fused_recurrent_kda_fwd_310p
         assert getattr(bm3, "causal_conv1d_fn") is not before["causal_conv1d_fn"]
         assert getattr(bm3, "causal_conv1d_update") is not before["causal_conv1d_update"]
+        # The gated RMS-norm (TRITON on upstream) is rebound in both import
+        # sites the KDA block can resolve it from.
+        la_mod = sys.modules["vllm_ascend.ops.layernorm"]
+        kda_triton_mod = sys.modules["vllm_ascend.ops.triton.kda.kda"]
+        assert la_mod.rms_norm_gated is kda.rms_norm_gated_310p
+        assert kda_triton_mod.rms_norm_gated is kda.rms_norm_gated_310p
+
+    def test_rms_norm_gated_matches_reference(self, monkeypatch: pytest.MonkeyPatch):
+        # Kernel semantics (IS_RMS_NORM path, fp32 compute, gate after the
+        # weight/bias): y = x*rsqrt(mean(x^2)+eps)*w + b; y *= silu(g)/sigmoid(g).
+        # Inputs are fp32; the fp64 reference is computed from the same
+        # fp32 values (the implementation downcasts to fp32 like upstream).
+        kda = _load_kda_module(monkeypatch)
+        x32 = torch.randn(4, 3, 8, dtype=torch.float32)
+        g32 = torch.randn(4, 3, 8, dtype=torch.float32)
+        w32 = torch.randn(8, dtype=torch.float32) + 2.0
+        b32 = torch.randn(8, dtype=torch.float32)
+        x, g, w, b = (t.double() for t in (x32, g32, w32, b32))
+        eps = 1e-5
+        normed = x * torch.rsqrt(x.pow(2).mean(dim=-1, keepdim=True) + eps) * w + b
+        out = kda.rms_norm_gated_310p(x32, g32, w32, b32, "swish", eps=eps)
+        assert torch.allclose(out.double(), normed * g * torch.sigmoid(g), atol=1e-6)
+        out2 = kda.rms_norm_gated_310p(x32, g32, w32, b32, "sigmoid", eps=eps)
+        assert torch.allclose(out2.double(), normed * torch.sigmoid(g), atol=1e-6)
+        # Unsupported variants must fail loud, not approximate.
+        with pytest.raises(RuntimeError):
+            kda.rms_norm_gated_310p(x, g, w, b, "swish", residual=torch.zeros_like(x))
+        with pytest.raises(RuntimeError):
+            kda.rms_norm_gated_310p(x, g, w, b, "swish", prenorm=True)
+        # Input dtype is preserved (fp32 compute, cast back).
+        out16 = kda.rms_norm_gated_310p(x.half(), g.half(), w.half(), b.half(), "swish")
+        assert out16.dtype is torch.float16
+        # The out= buffer path writes in place.
+        buf = torch.empty_like(x)
+        ret = kda.rms_norm_gated_310p(x, g, w, b, "swish", eps=eps, out=buf)
+        assert ret is buf
 
     def test_kill_switch_is_noop(self, monkeypatch: pytest.MonkeyPatch):
         monkeypatch.setenv("VLLM_OMNI_310P_MING3TTS_PATCH", "0")

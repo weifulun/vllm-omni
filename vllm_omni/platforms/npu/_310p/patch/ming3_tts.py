@@ -54,6 +54,7 @@ from __future__ import annotations
 
 import logging
 import os
+from types import SimpleNamespace
 
 import torch
 
@@ -96,12 +97,17 @@ class _Ming3TTSLLMModel310P(ming3_tts_llm.Ming3TTSLLMModel):
         # 310P streaming decode state (part 4): the AudioVAE decoder is
         # attached by the wrapper subclass in _load_step_vae; per-request
         # causal-decode state lives here between steps.
-        self._npu310_vae: object | None = None
+        # Plain-object holder: assigning an nn.Module instance to an
+        # nn.Module attribute would auto-register it as a submodule
+        # (``model._npu310_vae.*`` then enters the checkpoint-completeness
+        # scan and fails); the wrapper already owns the VAE as
+        # ``audio_vae`` and marks those weights loaded.
+        self._npu310_holder = SimpleNamespace(vae=None)
         self._npu310_stream_state: dict[str, tuple] = {}
         self._npu310_past_kv: dict[str, object] = {}
 
     def _npu310_attach_audio_vae(self, vae: object) -> None:
-        self._npu310_vae = vae
+        self._npu310_holder.vae = vae
 
     def _maybe_build_cfm_graph(self, z_diff_cond: torch.Tensor) -> None:
         # Hard off on 310P (single-chip budget forbids graph capture; the
@@ -226,7 +232,8 @@ class _Ming3TTSLLMModel310P(ming3_tts_llm.Ming3TTSLLMModel):
             request_sample_eligible=request_sample_eligible,
             **kwargs,
         )
-        if self._npu310_vae is None or not isinstance(out, OmniOutput):
+        vae = self._npu310_holder.vae
+        if vae is None or not isinstance(out, OmniOutput):
             return out
         if out.multimodal_outputs is None or out.text_hidden_states is None:
             # Prefill step (no latent rows yet) or non-AR output: nothing
@@ -271,7 +278,7 @@ class _Ming3TTSLLMModel310P(ming3_tts_llm.Ming3TTSLLMModel):
             # The base set this step's stop decision before returning.
             finished = req_id in self._pending_postprocess_updates
             latent = latent_rows[row : row + 1]
-            waveform, stream_state, past_kv = self._npu310_vae.decode(  # type: ignore[union-attr]
+            waveform, stream_state, past_kv = vae.decode(
                 latent,
                 past_key_values=self._npu310_past_kv.get(req_id),
                 use_cache=True,
