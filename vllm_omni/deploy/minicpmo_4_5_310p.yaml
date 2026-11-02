@@ -113,9 +113,12 @@ connectors:
       enable_hift_graph: false
       enable_cfm_graph: false
       enable_code2wav_encoder_graph: false
-      # Real-device (128 C1, 2026-11-03, boot10-12): the per-request estimator
-      # attention cache is fp32 by default (~0.44 GiB per request, the exact
-      # 438 MiB OOM in _split_flow_cache on the chip shared with the Thinker
-      # TP2 rank). float16 halves it to ~219 MiB. The bf16 variant is
-      # CUDA-only by design (platforms/npu raises on it).
-      token2wav_float16: true
+      # REAL-DEVICE LESSON (128 C1, 2026-11-03, boot13): token2wav_float16 was
+      # TRIED here (the only layer that reaches code2wav's _extra_config()) and
+      # is REVERTED: it casts the whole CFM estimator to fp16 weights while the
+      # causal-conv1d chunk stream feeds fp32 inputs, so the first TTS request
+      # dies in CausalConv1d with "Input type (float) and bias type (c10::Half)
+      # should be the same" and kills the stage-2 replica. The stage-0 dummy
+      # shrink (platform-layer max_num_batched_tokens: 2048) frees the memory
+      # on its own, so the fp32 estimator cache (438 MiB per request) now fits
+      # on chip1. Do not re-enable without an fp16 input-cast patch first.
