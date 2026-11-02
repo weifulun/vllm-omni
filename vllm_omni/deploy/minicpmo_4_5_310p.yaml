@@ -32,7 +32,11 @@ stages:
     # retained caching-allocator blocks under the EH0012 no-op (aee740b99):
     # peak = base + dummy activations + retained cache, and the margin is what
     # funds the 8192-token KV check (0.57 GiB engine-side).
-    max_num_batched_tokens: 4096
+    # boot10/11 (2026-11-03): 4096 -> 2048. The dummy-run activation high-water
+    # stays in the caching pool per TP rank (measured 14.5 GiB/rank on chip1);
+    # halving the dummy halves that retained pool and leaves the ~0.2-2 GiB
+    # headroom the stage-2 TTS flow cache needs on the shared chip.
+    max_num_batched_tokens: 2048
     # Real-device first boot (128 C1, 2026-11-02): the base PIECEWISE
     # compiled decode fails on 310P — aclnnApplyRotaryPosEmbV2 gets a null
     # cos tensor under the torch.compile/AOTAutograd partition
@@ -84,6 +88,13 @@ platforms:
         kv_cache_memory_bytes: 1073741824
         additional_config:
           code2wav_enable_npu_graph: false
+          # Real-device (128 C1, 2026-11-03, boot10/11): the per-request
+          # estimator attention cache is fp32 by default (~0.44 GiB per
+          # request); token2wav_float16 runs the flow estimator attention in
+          # fp16 and halves the cache (438 MiB -> ~219 MiB), which is the
+          # difference between OOM and success on the chip shared with the
+          # Thinker TP2 rank. The bf16 variant is CUDA-only by design.
+          token2wav_float16: true
 
 connectors:
   connector_of_shared_memory:
