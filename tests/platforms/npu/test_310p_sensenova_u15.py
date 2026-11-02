@@ -194,11 +194,19 @@ def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         def __init__(self, od_config=None):
             self.od_config = od_config
 
+    def fake_load_image_native(img, *, patch_size, downsample_ratio, min_pixels, max_pixels):
+        # Stand-in for the pipeline's smart-resize/patchify loader: fp32
+        # pixel values + (1, 2) grid_hw, as the real one returns.
+        pv = torch.randn(1, 3, 2 * patch_size, 2 * patch_size)
+        ghw = torch.tensor([[2, 2]], dtype=torch.long)
+        return pv, ghw
+
     _install_fake_module(
         monkeypatch,
         "vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1",
         SenseNovaU1Pipeline=FakeSenseNovaU1Pipeline,
         get_sensenova_u1_post_process_func=lambda od_config: (lambda x: x),
+        _load_image_native=fake_load_image_native,
     )
     captured["fake_pipeline_module"] = sys.modules["vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1"]
 
@@ -459,6 +467,29 @@ def test_int8_load_device_flip_inactive_for_cpu_target(monkeypatch: pytest.Monke
     loader_cls = captured["loader_module"].DiffusersPipelineLoader
     loader_cls._init_from_load_format(object(), "default", _DeviceLike("cpu"))
     assert str(flipped._load_device) == "cpu"
+
+
+def test_prepare_input_images_follows_serving_dtype_not_bf16(monkeypatch: pytest.MonkeyPatch):
+    """310P real-device evidence: the startup dummy run (routed to it2i by
+    the engine's synthetic image) died with AclNN EZ1001 'tensor 0 not
+    implemented for DT_BFLOAT16' - upstream hardcodes bf16 pixel_values and
+    310P rejects every bf16 op.  The override must take the serving dtype
+    (fp16) from od_config so img2img/img2text work on 310P."""
+    captured = _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+    cls = module._build_310p_pipeline_cls()
+
+    od_config = _make_od_config(dtype=torch.float16)  # --dtype float16
+    pipe = cls(od_config=od_config)
+    pipe.device = "cpu"  # stand-in device; pv.to("cpu") is a no-op move
+    pipe.vis_cfg = SimpleNamespace(patch_size=2)
+    pipe.downsample_ratio = 0.5
+
+    pixel_values, grid_hw = pipe._prepare_input_images([object()])
+    assert pixel_values.dtype == torch.float16
+    assert pixel_values.device == torch.device("cpu")
+    assert grid_hw.dtype == torch.long
+    assert grid_hw.shape == (1, 2)
 
 
 def test_vision_pins_run_after_weight_load(monkeypatch: pytest.MonkeyPatch):

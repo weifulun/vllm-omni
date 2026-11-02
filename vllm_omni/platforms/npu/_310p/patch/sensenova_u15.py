@@ -483,6 +483,46 @@ class _SenseNovaU15Overrides:
         ns.t_floats = [float(x) for x in ns.timesteps.detach().cpu()]
         return ns
 
+    def _prepare_input_images(self, images: list) -> Any:
+        """310P: pixel_values take the serving dtype, not hardcoded bf16.
+
+        Upstream (pipeline_sensenova_u1.py ``_prepare_input_images``) ends
+        with ``pv.to(self.device, dtype=torch.bfloat16)`` - fine on A800s,
+        fatal on 310P where every op rejects DT_BFLOAT16 (first observed as
+        ``AclNN_Parameter_Error(EZ1001): tensor 0 not implemented for
+        DT_BFLOAT16`` from the cat kernel inside the startup dummy run, and
+        it would equally kill the real img2img/img2text paths).  The model
+        loads in the configured dtype (fp16 on 310P), so pixel values must
+        match it.  Falls back to bf16 only when the serving dtype is
+        unavailable (upstream behavior).
+        """
+        from vllm_omni.diffusion.models.sensenova_u1.pipeline_sensenova_u1 import _load_image_native
+
+        pixel_values_list = []
+        grid_hw_list = []
+        num_images = len(images)
+        max_pixels_per_image = min(2048 * 2048, (4096 * 4096) // num_images)
+        pixel_dtype = getattr(getattr(self, "od_config", None), "dtype", None)
+        if pixel_dtype is None:
+            vision_model = getattr(self, "vision_model", None)
+            try:
+                pixel_dtype = next(vision_model.parameters()).dtype if vision_model is not None else None
+            except StopIteration:
+                pixel_dtype = None
+        if pixel_dtype is None:
+            pixel_dtype = torch.bfloat16
+        for img in images:
+            pv, ghw = _load_image_native(
+                img,
+                patch_size=self.vis_cfg.patch_size,
+                downsample_ratio=self.downsample_ratio,
+                min_pixels=512 * 512,
+                max_pixels=max_pixels_per_image,
+            )
+            pixel_values_list.append(pv.to(self.device, dtype=pixel_dtype))
+            grid_hw_list.append(ghw.to(self.device))
+        return torch.cat(pixel_values_list), torch.cat(grid_hw_list)
+
     def _t2i_predict_v(
         self,
         input_embeds: torch.Tensor,
