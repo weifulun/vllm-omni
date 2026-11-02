@@ -103,6 +103,15 @@ class AuKForConditionalGeneration(nn.Module, SupportsMultiModal, SupportsPP, Sup
 
         thinker_config = config.thinker_config
         self.thinker_config = thinker_config
+        # 310P: aclnn RopeWithSinCosCacheV2 (npu_mrope) has no 310P kernel —
+        # route MRoPE to the torch-native path before the thinker layers are
+        # built.  No-op off-310P; see platforms/npu/_310p/patch/rotary.py.
+        try:
+            from vllm_omni.platforms.npu._310p.patch.rotary import maybe_patch_310p_mrope
+
+            maybe_patch_310p_mrope()
+        except Exception:  # pragma: no cover - patch is best-effort
+            pass
         self.thinker = init_vllm_registered_model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "thinker"),

@@ -295,3 +295,81 @@ def test_dispatch_env_disable(monkeypatch):
     init.apply_diffusion_310p_patches(_fake_od_config())
 
     assert called["flag"] is False
+
+
+# ---------------------------------------------------------------------------
+# AR-worker MRoPE patch (rotary.py)
+# ---------------------------------------------------------------------------
+
+
+def _install_rotary_fakes(monkeypatch, is_310p_value: bool):
+    _install_fake_module(
+        monkeypatch, "torch_npu",
+        npu=SimpleNamespace(get_device_name=lambda idx: "Ascend310P3"),
+    )
+    for name in ("vllm", "vllm.model_executor", "vllm.model_executor.layers"):
+        monkeypatch.setitem(sys.modules, name, _install_fake_module(monkeypatch, name))
+
+    # Fresh class objects per test: the patch rewrites class attributes in
+    # place, so a module-level shared class would leak state between tests.
+    class _FakeBaseMRoPE:
+        def forward_oot(self, positions, query, key):  # noqa: N803
+            return ("torch-native", positions, query, key)
+
+    class _FakeAscendMRoPE:
+        """Stand-in for vllm_ascend.ops.rotary_embedding.AscendMRotaryEmbedding."""
+
+        def forward_oot(self, positions, query, key):  # noqa: N803
+            return ("ascend-fast-path", positions, query, key)
+
+    _install_fake_module(
+        monkeypatch, "vllm.model_executor.layers.rotary_embedding", MRotaryEmbedding=_FakeBaseMRoPE,
+    )
+    for name in ("vllm_ascend", "vllm_ascend.ops"):
+        monkeypatch.setitem(sys.modules, name, _install_fake_module(monkeypatch, name))
+    _install_fake_module(
+        monkeypatch, "vllm_ascend.ops.rotary_embedding", AscendMRotaryEmbedding=_FakeAscendMRoPE,
+    )
+    for name in ("vllm_omni", "vllm_omni.platforms", "vllm_omni.platforms.npu"):
+        monkeypatch.setitem(sys.modules, name, _install_fake_module(monkeypatch, name))
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.platforms.npu._310p",
+        is_310p=lambda device=None: is_310p_value,
+    )
+    return _FakeBaseMRoPE, _FakeAscendMRoPE
+
+
+def _load_rotary_patch(monkeypatch):
+    return _load_source_module(
+        "auk_rotary_patch_under_test",
+        _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch" / "rotary.py",
+    )
+
+
+def test_rotary_310p_routes_mrope_to_torch(monkeypatch):
+    """On 310P the fast-path aclnn kernel is replaced by the torch-native
+    forward_oot (EZ1001: RopeWithSinCosCacheV2 has no 310P dtype coverage)."""
+    _load_rotary_patch(monkeypatch)
+    base, ascend_cls = _install_rotary_fakes(monkeypatch, is_310p_value=True)
+    module = _load_rotary_patch(monkeypatch)
+
+    module.maybe_patch_310p_mrope()
+
+    assert ascend_cls.forward_oot is base.forward_oot
+    assert getattr(ascend_cls, "_auk_310p_mrope_patched", False) is True
+    # Idempotent: a second call must be a no-op, not a re-wrap error.
+    module.maybe_patch_310p_mrope()
+    assert ascend_cls.forward_oot is base.forward_oot
+
+
+def test_rotary_off_310p_is_noop(monkeypatch):
+    _load_rotary_patch(monkeypatch)
+    base, ascend_cls = _install_rotary_fakes(monkeypatch, is_310p_value=False)
+    module = _load_rotary_patch(monkeypatch)
+
+    module.maybe_patch_310p_mrope()
+
+    # The fast path is untouched: behaviour and patch flag both unchanged.
+    assert ascend_cls().forward_oot(None, None, None)[0] == "ascend-fast-path"
+    assert not hasattr(ascend_cls, "_auk_310p_mrope_patched")
