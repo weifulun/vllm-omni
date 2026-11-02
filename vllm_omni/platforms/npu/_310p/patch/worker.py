@@ -183,8 +183,96 @@ def _install_empty_cache_noop() -> None:
         pass
 
 
+def _install_shared_chip_kv_fix() -> None:
+    """310P multi-stage same-chip KV budget fix (task-8, 128 C1, 2026-11-03).
+
+    The vendor 310P worker sizes the KV budget as
+    ``(requested_memory - profile_peak - non_torch_cleared) // 2`` where
+    ``requested_memory = gpu_memory_utilization * total``. The profile
+    measurement reflects the PHYSICAL chip occupancy at profile time, so on a
+    chip that an earlier stage already occupies (MiniCPM-o places stage 0 at
+    TP2 on both chips, the stage 1 talker on chip 0, stage 2 on chip 1) the
+    late-stage worker sees the predecessor's residue inside the measured peak
+    while its own ``gpu_memory_utilization`` stays small (base 0.10 for
+    stage 1): the formula goes strongly negative (real-device:
+    "Available KV cache memory: -6.33 GiB") and the engine aborts with
+    "No available memory for the cache blocks" even though several GiB are
+    physically free. Raising the late stage's mmu cannot fix it — the vendor
+    ``_init_device`` free check (``free < requested -> raise``) rejects the
+    mmu values that would make the formula positive.
+
+    For workers whose chip carries more than 50% external residue at worker
+    init, replace the budget with the physically free-based one:
+    free-after-profile minus a 0.5 GiB safety margin (retained caching
+    allocator blocks are already outside ``free`` and hence already
+    accounted for), capped by the stage's explicit
+    ``kv_cache_memory_bytes`` when the deployment sets one. Fresh-chip
+    workers (residue <= 50%, e.g. stage 0 on the idle chips at boot) keep
+    the vendor path completely untouched.
+    """
+    import logging
+
+    import torch
+
+    logger = logging.getLogger(__name__)
+
+    try:
+        import vllm_ascend._310p.worker_310p as w310
+    except ImportError:  # pragma: no cover - vendor module optional here
+        return
+
+    worker_cls = getattr(w310, "NPUWorker310", None)
+    if worker_cls is None or getattr(worker_cls, "_omni_310p_shared_chip_kv", False):
+        return
+
+    original = worker_cls.determine_available_memory
+
+    def determine_available_memory(self):
+        snap = self.init_snapshot
+        residue = snap.total_memory - snap.free_memory
+        if residue <= 0.5 * snap.total_memory:
+            return original(self)
+        gib = 1024**3
+        rank = getattr(self, "rank", "?")
+        logger.info(
+            "[310P][rank%s] shared-chip KV budget mode: %.2f GiB external "
+            "residue on %.2f GiB chip at worker init (vendor mmu formula is "
+            "ill-posed on an occupied chip)",
+            rank, residue / gib, snap.total_memory / gib,
+        )
+        free_before, _ = torch.npu.mem_get_info()
+        self.model_runner.profile_run()
+        torch.npu.synchronize()
+        free_after, _ = torch.npu.mem_get_info()
+        margin = int(0.5 * gib)
+        budget = int(max(free_after - margin, 0))
+        explicit = getattr(self.cache_config, "kv_cache_memory_bytes", None)
+        if explicit:
+            budget = min(budget, int(explicit))
+        try:
+            budget = int(self._scale_kv_cache_memory_for_multi_group(budget))
+        except Exception:  # noqa: BLE001 - single-KV-group models: keep raw
+            pass
+        self.available_kv_cache_memory_bytes = budget
+        logger.info(
+            "[310P][rank%s] Available KV cache memory: %.2f GiB "
+            "(free-based, shared chip; physical free %.2f -> %.2f GiB "
+            "across profile)",
+            rank, budget / gib, free_before / gib, free_after / gib,
+        )
+        return budget
+
+    determine_available_memory._omni_310p_shared_chip_kv = True
+    worker_cls.determine_available_memory = determine_available_memory
+    worker_cls._omni_310p_shared_chip_kv = True
+    logger.info(
+        "[310P] shared-chip KV budget fix installed on %s", worker_cls.__name__
+    )
+
+
 def apply_patch() -> None:
     # Triton-Ascend does not target 310P; use vLLM's native penalty path.
     AscendSampler310.apply_penalties = staticmethod(Sampler.apply_penalties)
     worker_base.OmniNPUWorkerBase = _OmniNPUWorkerBase310P
     _install_empty_cache_noop()
+    _install_shared_chip_kv_fix()
