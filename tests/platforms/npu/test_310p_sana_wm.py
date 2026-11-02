@@ -109,6 +109,16 @@ class _FakeGemmaEncoder(torch.nn.Module):
         return SimpleNamespace(last_hidden_state=torch.zeros(1, 300, 2304, dtype=torch.float32))
 
 
+class _FakeRotaryPosEmbed:
+    """CPU stand-in for SanaWmWanRotaryPosEmbed: the 310P patch swaps
+    ``_build_1d_freq`` on this class for the duration of pipeline
+    construction; a call to the (upstream) body proves the swap leaked."""
+
+    @staticmethod
+    def _build_1d_freq(dim, positions):
+        raise AssertionError("upstream _build_1d_freq called under the 310P patch")
+
+
 class FakeSanaWmPipeline(torch.nn.Module):
     """Stand-in for the built-in SANA-WM pipeline: same attribute surface the
     310P subclass touches, devices resolved to CPU on the test host."""
@@ -166,6 +176,21 @@ def _install_sana_wm_patch_fakes(monkeypatch: pytest.MonkeyPatch, registry_calls
     _install_fake_module(monkeypatch, "vllm_omni.diffusion")
     _install_fake_module(monkeypatch, "vllm_omni.diffusion.models")
     _install_fake_module(monkeypatch, "vllm_omni.diffusion.models.sana_wm")
+    # The 310P patch imports the camera-path module (ucpe) and the two RoPE
+    # symbols from the transformer module; stand both in on the CPU host.
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.sana_wm.ucpe",
+        _apply_complex_rope=lambda *a, **k: (_ for _ in ()).throw(
+            AssertionError("upstream ucpe rope must be replaced before use")
+        ),
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.sana_wm.sana_wm_transformer",
+        SanaWmSelfAttention=type("SanaWmSelfAttention", (), {}),
+        SanaWmWanRotaryPosEmbed=_FakeRotaryPosEmbed,
+    )
     _install_fake_module(
         monkeypatch,
         "vllm_omni.diffusion.registry",
@@ -376,3 +401,117 @@ def test_diffusion_registry_env_escape_hatch(monkeypatch: pytest.MonkeyPatch) ->
     od = SimpleNamespace(model_class_name="SanaWmPipeline")
     patch_init.apply_diffusion_310p_patches(od)
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# 310P real-arithmetic RoPE: CPU numeric contracts.  Each test compares the
+# 310P replacement against the upstream float64/complex128 reference on CPU
+# (the exact math the NPU kernel would have executed); on 310P the only
+# difference is fp32 accumulation in place of fp64 (below the fp16 noise
+# floor), which these CPU comparisons upper-bound.
+# ---------------------------------------------------------------------------
+
+
+def _upstream_rope_apply_reference(hidden_states: torch.Tensor, freqs: torch.Tensor) -> torch.Tensor:
+    """Upstream SanaWmSelfAttention._apply_rotary_emb, verbatim math (CPU fp64).
+
+    ``.contiguous()`` is added only to make ``view_as_complex`` layout-robust
+    across torch builds (it preserves the values; the product is elementwise).
+    """
+    rotated = torch.view_as_complex(
+        hidden_states.permute(0, 1, 3, 2).to(torch.float64).contiguous().unflatten(3, (-1, 2))
+    )
+    output = torch.view_as_real(rotated * freqs).flatten(3, 4).permute(0, 1, 3, 2)
+    return output.type_as(hidden_states)
+
+
+def _upstream_ucpe_rope_reference(
+    hidden_states: torch.Tensor,
+    freqs: torch.Tensor,
+    *,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """Upstream ucpe._apply_complex_rope, verbatim (CPU fp64)."""
+    x_real = hidden_states.to(torch.float64).contiguous()
+    x_complex = torch.view_as_complex(x_real.unflatten(-1, (-1, 2)))
+    if inverse:
+        freqs = freqs.conj()
+    x_out = torch.view_as_real(x_complex * freqs).flatten(-2, -1)
+    return x_out.to(hidden_states.dtype)
+
+
+def test_rope_table_builder_matches_upstream_formula(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_310P_SANA_WM_ENCODER_ON_NPU", raising=False)
+    module, _calls = _load_sana_wm_patch(monkeypatch)
+
+    theta = 10000.0
+    fake_self = SimpleNamespace(theta=theta)
+    positions = torch.arange(37, dtype=torch.float64)
+    got = module._build_1d_freq_310p(fake_self, 12, positions)
+
+    # Upstream formula, verbatim (CPU fp64, complex128).
+    freqs = 1.0 / (
+        theta ** (torch.arange(0, 12, 2, dtype=torch.float64)[: 12 // 2] / 12)
+    )
+    phase = torch.outer(positions, freqs)
+    ref = torch.polar(torch.ones_like(phase), phase)
+
+    assert got.dtype is torch.complex64
+    assert got.device.type == "cpu"
+    torch.testing.assert_close(got.to(torch.complex128), ref, rtol=1e-6, atol=1e-9)
+
+    # Empty-dim branch: upstream returns an empty complex table, no polar.
+    empty = module._build_1d_freq_310p(fake_self, 0, positions)
+    assert empty.dtype is torch.complex64
+    assert empty.shape == (37, 0)
+
+
+def test_rope_apply_real_matches_upstream_complex(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_310P_SANA_WM_ENCODER_ON_NPU", raising=False)
+    module, _calls = _load_sana_wm_patch(monkeypatch)
+
+    torch.manual_seed(0)
+    # Call-site layout: (B, H, D, N) after the q/k pre-permute.
+    hidden = torch.randn(2, 3, 8, 30, dtype=torch.float16)
+    freqs = torch.complex(
+        torch.randn(1, 1, 30, 4, dtype=torch.float32),
+        torch.randn(1, 1, 30, 4, dtype=torch.float32),
+    )
+
+    got = module._rope_apply_real_forward(hidden, freqs)
+    ref = _upstream_rope_apply_reference(hidden, freqs)
+
+    assert got.dtype is torch.float16
+    torch.testing.assert_close(got, ref, rtol=2e-3, atol=1e-3)
+
+
+def test_ucpe_rope_real_matches_upstream_complex(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_310P_SANA_WM_ENCODER_ON_NPU", raising=False)
+    module, _calls = _load_sana_wm_patch(monkeypatch)
+
+    torch.manual_seed(1)
+    hidden = torch.randn(2, 7, 12, dtype=torch.float16)
+    freqs = torch.complex(
+        torch.randn(7, 6, dtype=torch.float32),
+        torch.randn(7, 6, dtype=torch.float32),
+    )
+
+    got_fwd = module._ucpe_rope_apply_real(hidden, freqs, inverse=False)
+    ref_fwd = _upstream_ucpe_rope_reference(hidden, freqs, inverse=False)
+    torch.testing.assert_close(got_fwd, ref_fwd, rtol=2e-3, atol=1e-3)
+
+    got_inv = module._ucpe_rope_apply_real(hidden, freqs, inverse=True)
+    ref_inv = _upstream_ucpe_rope_reference(hidden, freqs, inverse=True)
+    torch.testing.assert_close(got_inv, ref_inv, rtol=2e-3, atol=1e-3)
+    assert got_inv.dtype is torch.float16
+
+
+def test_patch_apply_replaces_ucpe_rope(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("VLLM_OMNI_310P_SANA_WM_ENCODER_ON_NPU", raising=False)
+    module, _calls = _load_sana_wm_patch(monkeypatch)
+    od_config = _make_od_config()
+
+    module.apply_diffusion_310p_patches(od_config)
+
+    fake_ucpe = sys.modules["vllm_omni.diffusion.models.sana_wm.ucpe"]
+    assert fake_ucpe._apply_complex_rope is module._ucpe_rope_apply_real

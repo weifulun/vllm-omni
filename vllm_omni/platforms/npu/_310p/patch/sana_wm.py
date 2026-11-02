@@ -47,10 +47,15 @@ from typing import Any
 
 import torch
 
+import vllm_omni.diffusion.models.sana_wm.ucpe as _sana_wm_ucpe
 from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
     SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmPipeline,
     get_sana_wm_pre_process_func,
+)
+from vllm_omni.diffusion.models.sana_wm.sana_wm_transformer import (
+    SanaWmSelfAttention,
+    SanaWmWanRotaryPosEmbed,
 )
 
 logger = logging.getLogger(__name__)
@@ -73,6 +78,84 @@ def _encoder_on_npu() -> bool:
     return os.environ.get(_ENCODER_ON_NPU_ENV, "0") == "1"
 
 
+# ---------------------------------------------------------------------------
+# 310P RoPE: real-arithmetic replacements for the upstream float64/complex128
+# path.  Upstream builds the Wan-style RoPE table with ``torch.polar`` on
+# float64 and applies it via ``view_as_complex`` + complex128 multiply
+# (``sana_wm_transformer.py::_build_1d_freq`` / ``SanaWmSelfAttention.
+# _apply_rotary_emb`` / ``ucpe.py::_apply_complex_rope``).  On 310P the model
+# is constructed inside an NPU device context, so the bare ``torch.arange``
+# lands on npu:0 and ``aclnnPolar`` rejects DT_DOUBLE (supported list is
+# [DT_FLOAT]); complex128 / DT_DOUBLE kernels are unavailable.  The table is
+# rebuilt on the CPU (fp64 arithmetic, numerically identical to the upstream
+# formula) and stored complex64; both apply sites decompose the complex
+# multiply into four real fp32 MACs per pair — exact algebra, accumulation
+# promoted from fp64 to fp32 (below the fp16 output noise floor).
+# ---------------------------------------------------------------------------
+
+
+def _build_1d_freq_310p(self, dim: int, positions: torch.Tensor) -> torch.Tensor:
+    """310P CPU/fp32 replacement for ``SanaWmWanRotaryPosEmbed._build_1d_freq``.
+
+    MIRROR of the upstream body with three 310P changes: all arithmetic on
+    the CPU (positions detached to CPU fp64), the table returned complex64
+    (upstream complex128).  Formula is unchanged.  Restored after pipeline
+    construction; only active while ``_SanaWm310P.__init__`` builds modules.
+    """
+    if dim <= 0:
+        return torch.empty(positions.shape[0], 0, dtype=torch.complex64, device=_CPU_DEVICE)
+    positions_cpu = positions.detach().to(device=_CPU_DEVICE, dtype=torch.float64)
+    # Explicit CPU device: the worker runs under an NPU default-device
+    # context, so a bare arange would land on npu:0 and mix devices against
+    # the CPU positions tensor.
+    exp = torch.arange(0, dim, 2, dtype=torch.float64, device=_CPU_DEVICE)[: dim // 2] / dim
+    freqs = 1.0 / (self.theta ** exp)
+    phase = torch.outer(positions_cpu, freqs)
+    return torch.polar(torch.ones_like(phase), phase).to(torch.complex64)
+
+
+def _rope_apply_real_forward(
+    hidden_states: torch.Tensor,
+    freqs: torch.Tensor,
+) -> torch.Tensor:
+    """310P real-arithmetic replacement for ``SanaWmSelfAttention._apply_rotary_emb``.
+
+    Mirrors the upstream body line-for-line (permute / unflatten / flatten /
+    permute order preserved) with the complex multiply decomposed:
+    ``x * (c + i*s) = (re*c - im*s) + i*(re*s + im*c)`` in fp32, cast back to
+    the input dtype.  Works for the ``freqs`` layouts passed at both call
+    sites (GDN q/k and softmax q/k).
+    """
+    x = hidden_states.permute(0, 1, 3, 2).to(torch.float32).unflatten(3, (-1, 2))
+    cos = freqs.real.to(torch.float32)
+    sin = freqs.imag.to(torch.float32)
+    re, im = x[..., 0], x[..., 1]
+    out = torch.stack((re * cos - im * sin, re * sin + im * cos), dim=-1)
+    return out.flatten(3, 4).permute(0, 1, 3, 2).to(hidden_states.dtype)
+
+
+def _ucpe_rope_apply_real(
+    hidden_states: torch.Tensor,
+    freqs: torch.Tensor,
+    *,
+    inverse: bool = False,
+) -> torch.Tensor:
+    """310P real-arithmetic replacement for ``ucpe._apply_complex_rope``.
+
+    Same decomposition as ``_rope_apply_real_forward`` with the ``inverse``
+    (conjugate) branch sign-flipping ``sin``; fp32 MACs, cast back to the
+    input dtype (mirrors the upstream ``x_out.to(hidden_states.dtype)``).
+    """
+    x = hidden_states.to(torch.float32).contiguous().unflatten(-1, (-1, 2))
+    cos = freqs.real.to(torch.float32)
+    sin = freqs.imag.to(torch.float32)
+    if inverse:
+        sin = -sin
+    re, im = x[..., 0], x[..., 1]
+    out = torch.stack((re * cos - im * sin, re * sin + im * cos), dim=-1)
+    return out.flatten(-2, -1).to(hidden_states.dtype)
+
+
 class _SanaWm310P(SanaWmPipeline):
     """SANA-WM pipeline specialized for the 310P NPU path.
 
@@ -88,7 +171,26 @@ class _SanaWm310P(SanaWmPipeline):
     """
 
     def __init__(self, *, od_config: Any = None, prefix: str = "") -> None:
-        super().__init__(od_config=od_config, prefix=prefix)
+        # 310P: model construction runs inside an NPU device context, where
+        # the upstream RoPE table build (float64 + torch.polar) hits the
+        # aclnnPolar DT_DOUBLE rejection.  Swap in the CPU/fp32 builder for
+        # the duration of module construction only (restored in finally).
+        _orig_build_1d_freq = SanaWmWanRotaryPosEmbed._build_1d_freq
+        SanaWmWanRotaryPosEmbed._build_1d_freq = _build_1d_freq_310p
+        try:
+            super().__init__(od_config=od_config, prefix=prefix)
+        finally:
+            SanaWmWanRotaryPosEmbed._build_1d_freq = _orig_build_1d_freq
+        # Runtime-rebuild shadow: ``SanaWmWanRotaryPosEmbed.forward`` rebuilds
+        # the table for shapes beyond the cached 1024 (line 614-615 of the
+        # upstream module) via ``self._build_1d_freq``; keep the CPU builder
+        # alive on this instance so that path never touches the NPU kernel.
+        rope = getattr(getattr(self, "transformer", None), "rope", None)
+        if rope is not None:
+            rope._build_1d_freq = lambda dim, positions: _build_1d_freq_310p(
+                rope, dim, positions
+            )
+        self._install_310p_rope_apply()
         if self.text_encoder is not None and not _encoder_on_npu():
             # Preprocessing-only module: keep it off the 310P NPU.
             self.text_encoder.to(device=_CPU_DEVICE, dtype=_RUNTIME_DTYPE)
@@ -97,6 +199,30 @@ class _SanaWm310P(SanaWmPipeline):
                 _CPU_DEVICE,
                 self.device,
                 _RUNTIME_DTYPE,
+            )
+
+    def _install_310p_rope_apply(self) -> None:
+        """Shadow ``SanaWmSelfAttention._apply_rotary_emb`` on every attention
+        instance of the constructed transformer with the fp32 real-arithmetic
+        version (the upstream staticmethod casts to float64 and runs
+        complex128 multiply, neither of which 310P implements).
+
+        Instance attributes shadow the class staticmethod for instance-level
+        calls only (both call sites are ``self._apply_rotary_emb(...)``), so
+        other pipelines in the process are untouched.
+        """
+        transformer = getattr(self, "transformer", None)
+        if transformer is None:
+            return
+        installed = 0
+        for module in transformer.modules():
+            if isinstance(module, SanaWmSelfAttention):
+                module._apply_rotary_emb = _rope_apply_real_forward
+                installed += 1
+        if installed:
+            logger.info(
+                "[310P] SANA-WM: real-arithmetic RoPE apply installed on %d attention module(s).",
+                installed,
             )
 
     def _encoder_device(self) -> torch.device:
@@ -177,6 +303,13 @@ def apply_diffusion_310p_patches(od_config) -> None:
 
     if _PATCHED:
         return
+
+    # The UCPE camera path (ucpe.py, SANA-WM-exclusive module) applies the
+    # same complex-RoPE in float64 (`_apply_complex_rope`, incl. the inverse
+    # conjugate branch).  Swap the module-level function for the fp32
+    # real-arithmetic version; `_prepare_ray_apply_fns` resolves the global
+    # by name at call time, so every `partial(...)` picks up the replacement.
+    _sana_wm_ucpe._apply_complex_rope = _ucpe_rope_apply_real
 
     from vllm_omni.diffusion.registry import register_diffusion_model
 
