@@ -363,7 +363,12 @@ def _install_encoder_cpu_guard() -> None:
         return out
 
     if _orig_embeds is not None:
-        Flux2KleinPipeline._get_qwen3_prompt_embeds = _get_qwen3_prompt_embeds_310p
+        # The original is a @staticmethod; rebind as a staticmethod so the
+        # pipeline's self._get_qwen3_prompt_embeds(...) call site keeps the
+        # plain-function arity (no implicit self bind).
+        Flux2KleinPipeline._get_qwen3_prompt_embeds = staticmethod(
+            _get_qwen3_prompt_embeds_310p
+        )
 
 
 def _install_vae_tiling_wrap() -> None:
