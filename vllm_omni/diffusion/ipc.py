@@ -279,6 +279,21 @@ def _tensor_from_shm(handle: dict[str, Any]) -> torch.Tensor:
     return tensor
 
 
+def _tensor_storage_unpicklable(t: torch.Tensor) -> bool:
+    """True for storages that cannot survive the MessageQueue pickle path.
+
+    The result queue pickles whatever packing leaves behind.  Pickling a
+    device tensor routes its storage through the legacy serialization path
+    (``torch/storage.py __reduce__`` -> ``torch.save(_use_new_zipfile_
+    serialization=False)`` -> ``_legacy_save`` -> ``storage._write_file``);
+    torch_npu cannot write NPU storages that way (machine-verified on 126/C3
+    2026-11-03: ``RuntimeError: unknown format type``), so every NPU tensor
+    must be D2H-routed through SHM even below the size threshold.  CPU and
+    CUDA storages pickle fine and keep the existing small-tensor path.
+    """
+    return t.device.type == "npu"
+
+
 def _pack_tensor_if_large(
     val: torch.Tensor,
     d2h_stream: torch.Stream | None = None,
@@ -292,13 +307,16 @@ def _pack_tensor_if_large(
     Pickle serializes a view's whole storage, so a batch of small views costs
     the full batch tensor once per request. Size the decision on the storage
     to keep those views off the wire; packing copies just the view.
+
+    Unpicklable device storages (NPU) are routed to SHM regardless of size:
+    see ``_tensor_storage_unpicklable``.
     """
     view_bytes = val.nelement() * val.element_size()
     try:
         storage_bytes = val.untyped_storage().nbytes()
     except Exception:
         storage_bytes = view_bytes
-    if max(view_bytes, storage_bytes) > _SHM_TENSOR_THRESHOLD:
+    if max(view_bytes, storage_bytes) > _SHM_TENSOR_THRESHOLD or _tensor_storage_unpicklable(val):
         return _tensor_to_shm(val, d2h_stream=d2h_stream, created=created, enable_registered_shm=enable_registered_shm)
     return val
 
