@@ -23,6 +23,13 @@ _QWEN3_TTS_CODE2WAV_ARCH = "Qwen3TTSCode2Wav"
 _DIFFUSION_310P_PATCH_MODULES: dict[str, list[str]] = {
     "StableDiffusionXLPipeline": ["vllm_omni.platforms.npu._310p.patch.sdxl"],
     "ZImagePipeline": ["vllm_omni.platforms.npu._310p.patch.z_image"],
+    # Ming-Image Design / Design-Layer (task-36): the diffusion registry knows
+    # both the primary name and the layered alias
+    # (_DIFFUSION_MODELS["MingImageLayeredDiffusionPipeline"] mirrors
+    # "MingImageDiffusionPipeline"); register both so the dispatch lands on
+    # either checkpoint variant.
+    "MingImageDiffusionPipeline": ["vllm_omni.platforms.npu._310p.patch.ming_image"],
+    "MingImageLayeredDiffusionPipeline": ["vllm_omni.platforms.npu._310p.patch.ming_image"],
 }
 
 
