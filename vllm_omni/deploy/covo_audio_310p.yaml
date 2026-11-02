@@ -1,0 +1,33 @@
+# Covo-Audio-Chat 310P (Atlas 300I Duo / Ascend 310P) deployment overlay.
+#
+# 310P is the FP16 line:
+#   * dtype float16 (pipeline-wide) — stage 0 (Qwen2 AR + Whisper encoder)
+#     materializes the bf16-on-disk checkpoint as fp16 (loader-ok
+#     already-fp16 pattern; 310P has no BF16, AclNN EZ1001 DT_BFLOAT16).
+#     Whisper encoder attention is additionally pinned to the eager (math)
+#     interface by vllm_omni/platforms/npu/_310p/patch/covo_audio.py.
+#   * Stage 1 (code2wav/token2wav) KEEPS the base yaml's dtype: float32 —
+#     BigVGAN + token2wav weights are fp32 and the upstream deploy pins fp32
+#     as the official contract (do NOT convert to fp16).  The per-stage
+#     field wins over the pipeline-wide dtype in the overlay merge.
+#
+# Capacity (lead-approved paper ledger, single 310P die 21589MB measured):
+#   * stage 0 gpu_memory_utilization 0.80 — ~16.8GB fp16 weights (Qwen2-7B
+#     backbone + Whisper-large-v3 encoder + audio adapter) + KV headroom.
+#   * stage 1 gpu_memory_utilization 0.14 — token2wav model.pt 1.86GB (out of
+#     the HF total, separate component) + flow-matching fp32 activations.
+#   * Thin margin (~3.97GB) is expected to be tight; e2e records npu-smi 1s
+#     peak sampling. OOM fallback per lead ruling = halve the official
+#     minimum-tier parameters (token count / duration), never push harder.
+#
+# Usage on the 310P card (single chip via ASCEND_RT_VISIBLE_DEVICES):
+#   vllm serve /models \
+#     --omni --trust-remote-code --port 8091 \
+#     --deploy-config vllm_omni/deploy/covo_audio_310p.yaml
+base_config: covo_audio.yaml
+dtype: float16
+stages:
+  - stage_id: 0
+    gpu_memory_utilization: 0.80
+  - stage_id: 1
+    gpu_memory_utilization: 0.14
