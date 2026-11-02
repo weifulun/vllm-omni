@@ -403,7 +403,8 @@ def _install_vae_tiling_wrap() -> None:
         # kernel rejects it ("Tensor weight not implemented for DT_BFLOAT16"
         # -> EZ1001 at the first encode).  Cast to FP16 here; chain-1
         # additionally moves the (now FP16) encoder to host memory.
-        enc_dtype = next(iter(getattr(self.text_encoder, "parameters", lambda: [])()), None)
+        _enc_p = next(iter(getattr(self.text_encoder, "parameters", lambda: [])()), None)
+        enc_dtype = _enc_p.dtype if _enc_p is not None else None
         if os.environ.get(_ENCODER_CPU_ENV, "0") == "1":
             enc = self.text_encoder
             if isinstance(enc, _CpuPinnedEncoder):
