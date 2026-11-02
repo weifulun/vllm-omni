@@ -238,16 +238,16 @@ def _wrap_ar_load_model_310p() -> None:
     except ImportError:
         return  # no AR worker in this environment (host contract tests)
 
-    if getattr(_ar_module.NPUArModelRunner, "_MM3_LOAD_WRAPPED", False):
+    if getattr(_ar_module.NPUARModelRunner, "_MM3_LOAD_WRAPPED", False):
         return
-    original = _ar_module.NPUArModelRunner.load_model
+    original = _ar_module.NPUARModelRunner.load_model
 
     def load_model_310p(self, *args, **kwargs):
         original(self, *args, **kwargs)
         _offload_talker_embeddings_310p(self)
 
-    _ar_module.NPUArModelRunner.load_model = load_model_310p
-    _ar_module.NPUArModelRunner._MM3_LOAD_WRAPPED = True
+    _ar_module.NPUARModelRunner.load_model = load_model_310p
+    _ar_module.NPUARModelRunner._MM3_LOAD_WRAPPED = True
 
 
 def apply_talker_patches() -> None:
