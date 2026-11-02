@@ -8,7 +8,19 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
-import onnxruntime
+
+try:
+    import onnxruntime
+except ImportError:
+    # Some Ascend images bundle an onnxruntime-cann build that is not
+    # ABI-compatible with the container's NumPy 2.x (pybind11 raises
+    # ImportError at import time). onnxruntime is only needed for the CPU
+    # campplus speaker-embedding fallback, which is built on first use and
+    # never reached when a device-side speaker path is installed (see the
+    # ``spk_model`` docstring), so degrade to a clear runtime error at first
+    # use instead of failing the module import.
+    onnxruntime = None
+
 import s3tokenizer
 import torch
 import torch.nn as nn
@@ -229,6 +241,13 @@ class StepAudio2Token2WavCore(nn.Module):
         """
         self._ensure_models_loaded()
         if self._spk_model is None:
+            if onnxruntime is None:
+                raise RuntimeError(
+                    "onnxruntime could not be imported in this environment; "
+                    "the CPU campplus speaker-embedding fallback is "
+                    "unavailable. Install an ABI-compatible onnxruntime "
+                    "build or use a device-side speaker path."
+                )
             option = onnxruntime.SessionOptions()
             option.graph_optimization_level = onnxruntime.GraphOptimizationLevel.ORT_ENABLE_ALL
             option.intra_op_num_threads = 1
@@ -252,7 +271,10 @@ class StepAudio2Token2WavCore(nn.Module):
     def _forward_spk_embedding(self, spk_feat: torch.Tensor) -> torch.Tensor:
         """Run campplus on ``[T, 80]`` fbank features; returns ``[1, 192]`` on ``self.device``."""
         spk_model = self.spk_model
-        if isinstance(spk_model, onnxruntime.InferenceSession):
+        if (
+            onnxruntime is not None
+            and isinstance(spk_model, onnxruntime.InferenceSession)
+        ):
             return torch.tensor(
                 spk_model.run(None, {spk_model.get_inputs()[0].name: spk_feat.unsqueeze(dim=0).cpu().numpy()})[0],
                 device=self.device,
