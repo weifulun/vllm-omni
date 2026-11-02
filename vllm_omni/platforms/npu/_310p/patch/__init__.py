@@ -70,18 +70,24 @@ def apply_diffusion_310p_patches(od_config) -> None:
     never touch platform.py.  Pipelines without a registered 310P patch are a
     no-op (they run on the generic 310P diffusion path).
 
-    ``VLLM_OMNI_310P_DIFFUSION_PATCHES=0`` disables the whole dispatch: it is
+    ``VLLM_OMNI_310P_DIFFUSION_PATCHES=0`` disables the 310P model patches
+    (dtype forcing, VAE tiling, CPU encoder pinning, warmup skip) only: it is
     the comparison hook for COMPARISON-POLICY.md §1 level 2 (run the generic
-    310P path with an explicit FP16 config as the same-seed reference).
+    310P path with an explicit FP16 config as the same-seed reference).  The
+    MATH-SDPA hardware shim is NOT part of that gate — the fused NPU SDPA
+    kernel is broken on 310P at the hardware level, so the math
+    decomposition applies to every 310P diffusion run (including the generic
+    level-2 reference) and is toggled only by
+    ``VLLM_OMNI_310P_FORCE_MATH_SDPA`` (default on).
     """
+    from vllm_omni.platforms.npu._310p.patch.attention import maybe_patch_sdpa_math
+
+    maybe_patch_sdpa_math()
+
     if os.environ.get("VLLM_OMNI_310P_DIFFUSION_PATCHES", "1") == "0":
         return
 
     _maybe_skip_startup_warmup()
-
-    from vllm_omni.platforms.npu._310p.patch.attention import maybe_patch_sdpa_math
-
-    maybe_patch_sdpa_math()
 
     model_arch = getattr(od_config, "model_class_name", None)
     module_names = _DIFFUSION_310P_PATCH_MODULES.get(model_arch)
