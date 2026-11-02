@@ -1,0 +1,574 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM-Omni project
+"""Contract tests for the MiniMax Music 3 310P patches.
+
+The host has no NPU and (in CI) no importable vllm, so the minimax_music3
+model modules are faked in ``sys.modules`` and the patch module is loaded
+from source, the same way the Qwen3-TTS patch contract test does it. Where
+a reference implementation matters (the sampler arithmetic, the streaming
+resampler, the depth-decoder block) the *real* upstream source is carved
+out of the repository files and executed, so the tests compare the 310P
+seams against upstream behavior rather than against a copy.
+"""
+
+from __future__ import annotations
+
+import ast
+import importlib.util
+import math
+import sys
+import types
+from collections.abc import Sequence
+from pathlib import Path
+
+import pytest
+import torch
+from torch import Tensor, nn
+from torch.nn import functional as F
+
+pytestmark = [pytest.mark.core_model, pytest.mark.cpu]
+
+_PATCH_SOURCE = Path("vllm_omni") / "platforms" / "npu" / "_310p" / "patch" / "minimax_music3.py"
+_DISPATCH_SOURCE = Path("vllm_omni") / "platforms" / "npu" / "_310p" / "patch" / "__init__.py"
+_MODEL_DIR = Path("vllm_omni") / "model_executor" / "models" / "minimax_music3"
+
+
+def _repo_root() -> Path:
+    marker = Path("vllm_omni") / "platforms" / "npu" / "_310p" / "patch"
+    for parent in Path(__file__).resolve().parents:
+        if (parent / marker).is_dir():
+            return parent
+    raise FileNotFoundError(f"could not locate repo root containing {marker}")
+
+
+def _load_source_module(name: str, path: Path):
+    spec = importlib.util.spec_from_file_location(name, path)
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load import spec for {path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _install_fake_module(monkeypatch: pytest.MonkeyPatch, name: str, **attrs):
+    module = types.ModuleType(name)
+    for key, value in attrs.items():
+        setattr(module, key, value)
+    monkeypatch.setitem(sys.modules, name, module)
+    return module
+
+
+def _class_from_source(path: Path, class_name: str, namespace: dict) -> type:
+    """Carve one class out of a real source file and exec it standalone."""
+    source = path.read_text()
+    tree = ast.parse(source)
+    node = next((n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == class_name), None)
+    if node is None:
+        raise AssertionError(f"{class_name} not found in {path}")
+    ns = dict(namespace)
+    exec(compile(ast.get_source_segment(source, node), str(path), "exec"), ns)
+    return ns[class_name]
+
+
+def _fake_logger(name: str):
+    import logging
+
+    return logging.getLogger(name)
+
+
+class _FakeAcousticModel(nn.Module):
+    """Just enough surface for the patched loader test."""
+
+    def __init__(self, dit: nn.Module, vocoder: nn.Module) -> None:
+        super().__init__()
+        self.dit = dit
+        self.vocoder = vocoder
+        self.model_path = "/fake/model"
+        self.vllm_config = types.SimpleNamespace(
+            model_config=types.SimpleNamespace(revision=None),
+            load_config=types.SimpleNamespace(download_dir=None),
+            device_config=types.SimpleNamespace(device=torch.device("cpu")),
+        )
+        self.dit_steps = 2
+        self.dit_cfg_scale = 1.7
+        self._loaded = False
+
+
+def _install_minimax_fakes(monkeypatch: pytest.MonkeyPatch, root: Path):
+    """Install fake minimax_music3 modules; return (patch module, fakes)."""
+    pkg_name = "vllm_omni.model_executor.models.minimax_music3"
+
+    # Fake the whole parent chain so the import machinery never touches the
+    # real vllm_omni package (whose __init__ imports vllm, which is broken on
+    # the py3.9 host and absent under CI pythons without a full env).
+    omni = _install_fake_module(monkeypatch, "vllm_omni")
+    model_executor = _install_fake_module(monkeypatch, "vllm_omni.model_executor")
+    models = _install_fake_module(monkeypatch, "vllm_omni.model_executor.models")
+    omni.model_executor = model_executor
+    model_executor.models = models
+
+    # Real sampling source (torch-only imports) under the fake dotted name:
+    # the seams must be tested against the upstream arithmetic itself.
+    _install_fake_module(
+        monkeypatch,
+        f"{pkg_name}.constants",
+        DIT_LATENT_CHANNELS=128,
+        DEFAULT_DIT_STEPS=30,
+        DEFAULT_DIT_CFG_SCALE=1.7,
+        AR_CFG_SCALE=1.5,
+        AR_CFG_TOP_K=50,
+        AR_TOP_K=50,
+    )
+    sampling = _load_source_module(f"{pkg_name}.sampling", root / _MODEL_DIR / "sampling.py")
+    monkeypatch.setitem(sys.modules, f"{pkg_name}.sampling", sampling)
+
+    dav_path = root / _MODEL_DIR / "dav.py"
+    real_resampler = _class_from_source(
+        dav_path,
+        "StreamingResampler",
+        namespace={
+            "torch": torch,
+            "Tensor": Tensor,
+            "nn": nn,
+            "math": math,
+            "Sequence": Sequence,
+            "init_logger": _fake_logger,
+            "DAV_SAMPLE_RATE": 44_100,
+            "OUTPUT_SAMPLE_RATE": 32_000,
+            "OUTPUT_CHANNELS": 2,
+        },
+    )
+
+    def _remove_weight_norm(module: nn.Module) -> int:
+        return 0
+
+    def _derive_seed(seed: int, *parts: object) -> int:
+        value = seed
+        for part in parts:
+            value = (value * 131 + sum(map(ord, str(part))) + len(str(part))) & 0xFFFFFFFF
+        return value
+
+    pkg = _install_fake_module(monkeypatch, pkg_name)
+    pkg.__path__ = []  # marks it as a package
+
+    acoustic = _install_fake_module(
+        monkeypatch,
+        f"{pkg_name}.acoustic",
+        MiniMaxMusic3AcousticForConditionalGeneration=_FakeAcousticModel,
+        _derive_seed=_derive_seed,
+    )
+    dav = _install_fake_module(
+        monkeypatch,
+        f"{pkg_name}.dav",
+        StreamingResampler=real_resampler,
+        remove_weight_norm=_remove_weight_norm,
+    )
+    dit = _install_fake_module(
+        monkeypatch,
+        f"{pkg_name}.dit",
+        MiniMaxMusic3FlowMatchingDiT=type("MiniMaxMusic3FlowMatchingDiT", (nn.Module,), {}),
+        MiniMaxMusic3Transformer1DModel=type("MiniMaxMusic3Transformer1DModel", (nn.Module,), {}),
+        Attention=type("Attention", (nn.Module,), {}),
+        remap_transformer_state=lambda state: state,
+        _SIGMA_FLOOR=1e-6,
+    )
+    rvq = _install_fake_module(
+        monkeypatch,
+        f"{pkg_name}.rvq_decoder",
+        DepthDecoderBlock=type("DepthDecoderBlock", (nn.Module,), {}),
+    )
+    talker = _install_fake_module(
+        monkeypatch,
+        f"{pkg_name}.talker",
+        apply_c0_cfg=sampling.apply_c0_cfg,
+        apply_depth_cfg=sampling.apply_depth_cfg,
+        draw_from_gumbel=sampling.draw_from_gumbel,
+        gumbel_noise=sampling.gumbel_noise,
+        sample_topk_seeded=sampling.sample_topk_seeded,
+    )
+    _install_fake_module(
+        monkeypatch,
+        f"{pkg_name}.chunking",
+        crop_sample_bounds=lambda window: (window.start, window.end),
+        overlap_mel_length=lambda: 24,
+    )
+    _install_fake_module(
+        monkeypatch,
+        f"{pkg_name}.weights",
+        CONDITION_ENCODER_DIR="condition_encoder",
+        TRANSFORMER_DIR="transformer",
+        VOCODER_DIR="vocoder",
+        load_component_state=lambda root, component, **kw: {},
+        resolve_repo_root=lambda *a, **kw: "/fake/root",
+    )
+    for name, module in (
+        ("acoustic", acoustic),
+        ("dav", dav),
+        ("dit", dit),
+        ("rvq_decoder", rvq),
+        ("talker", talker),
+    ):
+        setattr(pkg, name, module)
+    models.minimax_music3 = pkg
+
+    # vllm is broken on the py3.9 host; the patch module only needs its logger.
+    if "vllm" not in sys.modules or not hasattr(sys.modules.get("vllm", None), "logger"):
+        _install_fake_module(monkeypatch, "vllm")
+        _install_fake_module(monkeypatch, "vllm.logger", init_logger=_fake_logger)
+
+    patch = _load_source_module("vllm_omni.platforms.npu._310p.patch.minimax_music3", root / _PATCH_SOURCE)
+    return patch, {"sampling": sampling, "acoustic": acoustic, "dav": dav, "dit": dit, "rvq": rvq, "talker": talker}
+
+
+def _reset_patch_state(patch: types.ModuleType) -> None:
+    patch._TALKER_PATCHED = False
+    patch._ACOUSTIC_PATCHED = False
+    patch._NOISE_FALLBACK = False
+
+
+def _fresh(monkeypatch: pytest.MonkeyPatch, root: Path):
+    """Install fakes, load the patch module, and reset its latch state."""
+    patch, fakes = _install_minimax_fakes(monkeypatch, root)
+    _reset_patch_state(patch)
+    return patch, fakes
+
+
+# ---------------------------------------------------------------------------
+#  Stage 0: sampler seams + depth-decoder attention
+# ---------------------------------------------------------------------------
+
+
+def test_talker_apply_rebinds_and_is_idempotent(monkeypatch):
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    talker, sampling = fakes["talker"], fakes["sampling"]
+
+    patch.apply_talker_patches()
+    patch.apply_talker_patches()  # idempotent
+
+    for name in ("apply_c0_cfg", "apply_depth_cfg", "draw_from_gumbel", "gumbel_noise", "sample_topk_seeded"):
+        assert getattr(talker, name) is not getattr(sampling, name), name
+    # The generic sampling module itself is never mutated.
+    assert sampling.gumbel_noise.__name__ == "gumbel_noise"
+
+
+def test_talker_kill_switch_leaves_talker_untouched(monkeypatch):
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    talker, sampling = fakes["talker"], fakes["sampling"]
+    monkeypatch.setenv(patch._KILL_SWITCH_ENV, "0")
+
+    patch.apply_talker_patches()
+
+    for name in ("apply_c0_cfg", "apply_depth_cfg", "draw_from_gumbel", "gumbel_noise", "sample_topk_seeded"):
+        assert getattr(talker, name) is getattr(sampling, name), name
+    assert not patch._TALKER_PATCHED
+
+
+def test_sampler_seams_are_exact_cpu_passthrough(monkeypatch):
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    talker, sampling = fakes["talker"], fakes["sampling"]
+    patch.apply_talker_patches()
+
+    torch.manual_seed(7)
+    rows, vocab = 3, 64
+    logits = torch.randn(rows, vocab)
+    seeds = torch.tensor([11, 42, 9001])
+    positions = torch.tensor([0, 5, 99])
+
+    # CPU inputs: the seams must call the upstream primitives unchanged and
+    # return bit-identical results (the deterministic draws are the contract).
+    assert torch.equal(
+        talker.gumbel_noise(seeds, positions, vocab),
+        sampling.gumbel_noise(seeds, positions, vocab),
+    )
+    gumbel = sampling.gumbel_noise(seeds, positions, vocab)
+    assert torch.equal(talker.draw_from_gumbel(logits, gumbel), sampling.draw_from_gumbel(logits, gumbel))
+    cond, uncond = torch.randn(rows, vocab), torch.randn(rows, vocab)
+    assert torch.equal(talker.apply_c0_cfg(cond, uncond), sampling.apply_c0_cfg(cond, uncond))
+    assert torch.equal(talker.apply_depth_cfg(cond, uncond), sampling.apply_depth_cfg(cond, uncond))
+    assert torch.equal(
+        talker.sample_topk_seeded(logits, seeds, positions),
+        sampling.sample_topk_seeded(logits, seeds, positions),
+    )
+    # Determinism across calls is what the seed-exact double run relies on.
+    assert torch.equal(
+        talker.sample_topk_seeded(logits, seeds, positions),
+        talker.sample_topk_seeded(logits, seeds, positions),
+    )
+
+
+def test_depth_decoder_attention_matches_upstream_sdpa(monkeypatch):
+    root = _repo_root()
+    patch, _ = _fresh(monkeypatch, root)
+
+    rvq_path = root / _MODEL_DIR / "rvq_decoder.py"
+    block_cls = _class_from_source(
+        rvq_path,
+        "DepthDecoderBlock",
+        namespace={
+            "torch": torch,
+            "Tensor": Tensor,
+            "nn": nn,
+            "F": F,
+            "SDPBackend": torch.nn.attention.SDPBackend,
+            "sdpa_kernel": torch.nn.attention.sdpa_kernel,
+            "_SDPA_BACKENDS": [torch.nn.attention.SDPBackend.FLASH_ATTENTION, torch.nn.attention.SDPBackend.MATH],
+            "AUDIO_VOCAB_SIZE": 1024,
+            "BACKBONE_HIDDEN_SIZE": 4096,
+            "NUM_CODEBOOKS": 8,
+        },
+    )
+    torch.manual_seed(3)
+    block = block_cls(hidden_size=32, num_heads=4, intermediate_size=64)
+    x = torch.randn(2, 6, 32)
+
+    h_patched = patch._depth_decoder_block_forward_310p(block, x)
+    ref = block_cls.forward(block, x)  # upstream body, stock sdpa on CPU
+    assert torch.allclose(h_patched, ref, atol=1e-5, rtol=1e-4)
+
+
+# ---------------------------------------------------------------------------
+#  Stage 1: FP16 pin, resample/attention/RoPE/noise seams
+# ---------------------------------------------------------------------------
+
+
+def test_acoustic_apply_rebinds_and_is_idempotent(monkeypatch):
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    acoustic, dit, dav = fakes["acoustic"], fakes["dit"], fakes["dav"]
+
+    patch.apply_acoustic_patches()
+    patch.apply_acoustic_patches()  # idempotent
+
+    assert (
+        acoustic.MiniMaxMusic3AcousticForConditionalGeneration._load_components
+        is patch._load_components_310p
+    )
+    assert acoustic.MiniMaxMusic3AcousticForConditionalGeneration._decode_window is patch._decode_window_310p
+    assert dit.MiniMaxMusic3FlowMatchingDiT.forward is patch._dit_forward_310p
+    assert dit.MiniMaxMusic3FlowMatchingDiT.aligned_condition is patch._aligned_condition_310p
+    assert dit.MiniMaxMusic3Transformer1DModel._rope is patch._rope_310p
+    assert dit.Attention._attend is patch._attend_310p
+    assert dav.StreamingResampler.push is patch._resampler_push_310p
+
+
+def test_acoustic_kill_switch_leaves_classes_untouched(monkeypatch):
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    dit, dav = fakes["dit"], fakes["dav"]
+    monkeypatch.setenv(patch._KILL_SWITCH_ENV, "0")
+
+    patch.apply_acoustic_patches()
+
+    assert not patch._ACOUSTIC_PATCHED
+    assert dav.StreamingResampler.push.__name__ == "push"
+    assert not hasattr(dit.MiniMaxMusic3FlowMatchingDiT, "aligned_condition")
+
+
+def test_load_components_pins_float16(monkeypatch):
+    root = _repo_root()
+    patch, _ = _fresh(monkeypatch, root)
+
+    class _SwallowLoad(nn.Linear):
+        """Linear whose load_state_dict accepts the fake (empty) checkpoints."""
+
+        def load_state_dict(self, state, strict=True):
+            return types.SimpleNamespace(out_keys=[], missing_keys=[], unexpected_keys=[])
+
+    class _FakeDiT(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.condition_encoder = _SwallowLoad(4, 4, bias=False)
+            self.transformer = _SwallowLoad(4, 4, bias=False)
+
+    dit = _FakeDiT()
+    vocoder = _SwallowLoad(8, 8, bias=False)
+    model = _FakeAcousticModel(dit, vocoder)
+
+    patch._load_components_310p(model)
+
+    assert model._loaded
+    assert all(p.dtype == torch.float16 for p in model.dit.parameters())
+    assert all(p.dtype == torch.float16 for p in model.vocoder.parameters())
+    assert all(p.dtype == torch.float16 for p in model.parameters())
+
+
+def test_nearest_gather_is_bit_exact_vs_interpolate(monkeypatch):
+    root = _repo_root()
+    patch, _ = _fresh(monkeypatch, root)
+    torch.manual_seed(11)
+    for in_len in (7, 33, 250, 1000):
+        for mel_len in (1, 3, in_len, in_len * 2, 689):
+            align = torch.randn(1, 16, in_len)
+            expected = F.interpolate(align, size=mel_len, mode="nearest")
+            assert torch.equal(patch._nearest_gather_310p(align, mel_len), expected), (in_len, mel_len)
+
+
+def test_attend_310p_matches_sdpa(monkeypatch):
+    root = _repo_root()
+    patch, _ = _fresh(monkeypatch, root)
+    torch.manual_seed(5)
+    q = torch.randn(2, 4, 16, 8)
+    k = torch.randn(2, 4, 16, 8)
+    v = torch.randn(2, 4, 16, 8)
+    carrier = types.SimpleNamespace()
+    for is_causal in (False, True):
+        expected = F.scaled_dot_product_attention(q, k, v, is_causal=is_causal)
+        got = patch._attend_310p(carrier, q, k, v, is_causal=is_causal)
+        assert torch.allclose(got, expected, atol=1e-5, rtol=1e-4), is_causal
+
+
+def test_rope_310p_matches_upstream_tables(monkeypatch):
+    root = _repo_root()
+    patch, _ = _fresh(monkeypatch, root)
+    torch.manual_seed(13)
+    inv_freq = 1.0 / (10000.0 ** (torch.arange(0, 32, 2).float() / 32))
+    carrier = types.SimpleNamespace(inv_freq=inv_freq, _rope_cache={})
+
+    for seq_len in (1, 17, 689):
+        for dtype in (torch.float32, torch.float16):
+            got = patch._rope_310p(carrier, seq_len, dtype=dtype, device=torch.device("cpu"))
+            # Upstream arithmetic, computed the way the stock method does it.
+            t = torch.arange(seq_len, dtype=torch.float32)
+            freqs = torch.einsum("i,j->ij", t, inv_freq)
+            freqs = torch.cat((freqs, freqs), dim=-1).to(dtype=dtype)
+            expected = (freqs.cos().unsqueeze(1), freqs.sin().unsqueeze(1))
+            assert got[0].shape == expected[0].shape
+            assert torch.allclose(got[0], expected[0], atol=1e-3, rtol=1e-3)
+            assert torch.allclose(got[1], expected[1], atol=1e-3, rtol=1e-3)
+            # Cached on the second call under the same key.
+            again = patch._rope_310p(carrier, seq_len, dtype=dtype, device=torch.device("cpu"))
+            assert again[0] is got[0]
+
+
+def test_noise_draw_cpu_fallback_is_deterministic(monkeypatch):
+    root = _repo_root()
+    patch, _ = _fresh(monkeypatch, root)
+    patch._NOISE_FALLBACK = True
+    a = patch._draw_noise_310p((2, 8, 32), torch.device("cpu"), torch.float16, torch.Generator(), 42)
+    b = patch._draw_noise_310p((2, 8, 32), torch.device("cpu"), torch.float16, torch.Generator(), 42)
+    c = patch._draw_noise_310p((2, 8, 32), torch.device("cpu"), torch.float16, torch.Generator(), 43)
+    assert a.dtype == torch.float16
+    assert torch.equal(a, b)
+    assert not torch.equal(a, c)
+    patch._NOISE_FALLBACK = False
+
+
+def test_resampler_push_keeps_streaming_semantics(monkeypatch):
+    # The streaming resampler runs torchaudio's polyphase resample; the
+    # container (which has torchaudio) is the authoritative environment for
+    # this test.
+    pytest.importorskip("torchaudio")
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    resampler_cls = fakes["dav"].StreamingResampler
+    original_push = resampler_cls.push  # captured before the rebind
+
+    torch.manual_seed(21)
+    ref = resampler_cls(orig_freq=44100, new_freq=32000)
+    patched = resampler_cls(orig_freq=44100, new_freq=32000)
+    resampler_cls.push = patch._resampler_push_310p
+
+    expected: list[Tensor] = []
+    got: list[Tensor] = []
+    for i in range(6):
+        chunk = torch.randn(2, 173 * (i + 1))
+        flush = i == 5
+        expected.append(original_push(ref, [chunk], flush=flush))
+        got.append(patched.push([chunk], flush=flush))
+
+    assert len(expected) == len(got)
+    for e, g in zip(expected, got):
+        assert e.shape == g.shape
+        assert torch.equal(e, g)
+
+
+# ---------------------------------------------------------------------------
+#  Dispatch + ipc defense line
+# ---------------------------------------------------------------------------
+
+
+def test_dispatch_routes_each_arch(monkeypatch):
+    root = _repo_root()
+
+    calls = []
+
+    class _FakeApply:
+        def __init__(self, name):
+            self.name = name
+
+        def __call__(self):
+            calls.append(self.name)
+
+    _install_fake_module(monkeypatch, "vllm_omni")
+    _install_fake_module(monkeypatch, "vllm_omni.platforms")
+    _install_fake_module(monkeypatch, "vllm_omni.platforms.npu")
+    _install_fake_module(monkeypatch, "vllm_omni.platforms.npu._310p")
+    _install_fake_module(monkeypatch, "vllm_omni.platforms.npu._310p.patch")
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.platforms.npu._310p.patch.qwen3_tts",
+        apply_talker_patches=_FakeApply("qwen3_tts.talker"),
+        apply_code2wav_patches=_FakeApply("qwen3_tts.code2wav"),
+    )
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.platforms.npu._310p.patch.minimax_music3",
+        apply_talker_patches=_FakeApply("mm3.talker"),
+        apply_acoustic_patches=_FakeApply("mm3.acoustic"),
+    )
+    dispatch = _load_source_module(
+        "vllm_omni.platforms.npu._310p.patch.__init__",
+        root / _DISPATCH_SOURCE,
+    )
+
+    def _arch(name: str):
+        return types.SimpleNamespace(model_arch=name)
+
+    dispatch.apply_model_patches(_arch("Qwen3TTSTalkerForConditionalGeneration"))
+    dispatch.apply_model_patches(_arch("MiniMaxMusic3TalkerForConditionalGeneration"))
+    dispatch.apply_model_patches(_arch("MiniMaxMusic3ForConditionalGeneration"))  # dual spelling
+    dispatch.apply_model_patches(_arch("MiniMaxMusic3AcousticForConditionalGeneration"))
+    dispatch.apply_model_patches(_arch("SomeOtherArchitecture"))
+
+    assert calls == [
+        "qwen3_tts.talker",
+        "mm3.talker",
+        "mm3.talker",
+        "mm3.acoustic",
+    ]
+
+
+def test_ipc_routes_npu_storages_to_shm():
+    root = _repo_root()
+    ipc_path = root / "vllm_omni" / "diffusion" / "ipc.py"
+    source = ipc_path.read_text()
+
+    # The defense line exists: NPU storages are unpicklable and the pack
+    # decision consults it.
+    assert "def _tensor_storage_unpicklable(t: torch.Tensor) -> bool:" in source
+    assert 'return t.device.type == "npu"' in source
+    assert "or _tensor_storage_unpicklable(val)" in source
+
+    # Load only the pure predicate from source and exercise it.
+    tree = ast.parse(source)
+    node = next(
+        n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "_tensor_storage_unpicklable"
+    )
+    ns = {"torch": torch}
+    exec(compile(ast.get_source_segment(source, node), str(ipc_path), "exec"), ns)
+    unpicklable = ns["_tensor_storage_unpicklable"]
+
+    class _Dev:
+        def __init__(self, t):
+            self.type = t
+
+    class _FakeTensor:
+        def __init__(self, t):
+            self.device = _Dev(t)
+
+    assert unpicklable(_FakeTensor("npu"))
+    assert not unpicklable(_FakeTensor("cpu"))
+    assert not unpicklable(_FakeTensor("cuda"))

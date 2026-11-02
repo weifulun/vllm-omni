@@ -1,0 +1,108 @@
+# MiniMax-Music3 310P layout (task-32, Atlas 300I Duo chip C3 on node 126):
+# stage 0 (AR talker) on logical device 0, stage 1 (acoustic decoder) on
+# logical device 1, streaming 200-frame windows over shared memory. No HCCL,
+# no tensor parallelism: the two stages are two independent engines that
+# merely share a Duo card, so ASCEND_RT_VISIBLE_DEVICES=0,1 stays a single
+# multi-engine problem.
+#
+# Differences from minimax_music3_2gpu.yaml (the file this is based on):
+#
+# * dtype: float16 on both stages. 310P is an FP16/INT8 device; the 310P
+#   patches (platforms/npu/_310p/patch/minimax_music3.py) pin the acoustic
+#   loader to float16 instead of the upstream float32, and the talker stage
+#   runs the FP16 backbone the same way the other 310P AR lines do.
+#   (BF16 is not executable on 310P at all.)
+# * Stage-0 memory is sized for the 21.5 GB usable per chip: ~16.7 GB of
+#   FP16 weights (Qwen3-8B 16.0 + depth decoder 0.62 + audio embeddings 0.06)
+#   leave roughly 3 GB for the KV pool at gpu_memory_utilization 0.99,
+#   ~24k tokens. A CFG pair of the in-repo reference song needs about
+#   2 x (2k prompt + 7.2k frames) = 18.3k tokens (144 KiB/token), so the
+#   engine log must show KV >= ~19k tokens; if it does not, drop
+#   max_frames below 9000 for the benchmark or take the INT8 AR fallback
+#   (route A). Verify before trusting a full-length run.
+# * enforce_eager on both stages: fleet convention on 310P (the talker
+#   sampler and the depth-decoder loop are Python-side anyway, and the
+#   310P patches keep the depth loop on its eager path).
+#
+# The kill-switch run (POLICY section 1, arm B) starts the same pipeline with
+# VLLM_OMNI_310P_MINIMAX_MUSIC3_PATCH=0 so the stock CUDA-oriented paths run
+# against the same weights and request.
+pipeline: minimax_music3
+async_chunk: true
+
+# The repo-root config.json reports model_type=minimax_music3, which upstream
+# transformers does not ship a config class for.
+trust_remote_code: true
+
+connectors:
+  connector_of_shared_memory:
+    name: SharedMemoryConnector
+    extra:
+      # Stream stereo PCM back to the client as stage 1 finishes each window.
+      codec_streaming: true
+      # Window geometry is fixed by the checkpoint (200-frame windows on a
+      # 100-frame hop, models/minimax_music3/constants.py), so there are no
+      # codec_chunk_frames knobs here: changing the window changes the audio.
+      connector_get_sleep_s: 0.01
+      # One window is 200 AR frames = 8 s of music, so stage 1 waits far
+      # longer for a chunk than a per-step codec stage would. First chunk
+      # additionally covers stage-0 prefill of both CFG rows.
+      connector_get_max_wait_first_chunk: 30000
+      connector_get_max_wait: 10000
+
+stages:
+  - stage_id: 0
+    # One CFG pair at a time: the KV pool on a 21.5 GB chip cannot hold
+    # 16 rows, so concurrency is sized to the reference benchmark, not to
+    # the upstream card's figure.
+    max_num_seqs: 2
+    gpu_memory_utilization: 0.99
+    dtype: float16
+    # The checkpoint's max_position_embeddings is 10240 and the whole song
+    # is decoded in-context. Prompt cap 5000 + frame budget 9000 overrun
+    # 10240 for max-length inputs (a property of the checkpoint).
+    max_model_len: 10240
+    # One scheduler step must be able to prefill both rows of a pair
+    # (2 x 5000 prompt tokens) so the cond/uncond pair stays step-locked.
+    max_num_batched_tokens: 10240
+    # The 310P patches route the sampler and the depth-decoder attention
+    # away from the fused kernels 310P does not expose; keep everything
+    # eager.
+    enforce_eager: true
+    # A CFG pair must be sampled inside one engine step for the logits blend
+    # and the cond->uncond token copy to line up.
+    async_scheduling: false
+    enable_prefix_caching: false
+    devices: "0"
+    output_connectors:
+      to_stage_1: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 1.0
+      # The frame budget is enforced by the model. This ceiling only has to
+      # leave room for the extra step that delivers the final window.
+      max_tokens: 9002
+      extra_args:
+        cfg_role: cond
+        cfg_scale: 1.5
+
+  - stage_id: 1
+    # One row per user request: the uncond companion is stage-0-final and
+    # never reaches the acoustic stage.
+    max_num_seqs: 16
+    # No KV cache on this stage; the budget covers the FP16 DiT + condition
+    # encoder + vocoder (~5 GB) plus per-window latents and activations.
+    gpu_memory_utilization: 0.6
+    # The 310P patch pins the loader to float16; the engine dtype follows.
+    dtype: float16
+    enforce_eager: true
+    async_scheduling: false
+    enable_prefix_caching: false
+    max_model_len: 4096
+    max_num_batched_tokens: 4096
+    devices: "1"
+    input_connectors:
+      from_stage_0: connector_of_shared_memory
+    default_sampling_params:
+      temperature: 0.0
+      max_tokens: 4096
+      seed: 0
