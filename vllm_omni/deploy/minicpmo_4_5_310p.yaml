@@ -74,6 +74,14 @@ platforms:
       - stage_id: 1
         kv_cache_memory_bytes: 1073741824
       - stage_id: 2
+        # Real-device (128 C1, 2026-11-03): stage 2 shares chip1 with the
+        # Thinker TP2 rank. Without an explicit cap the shared-chip free-based
+        # KV sizing consumed nearly all remaining free memory as KV, leaving
+        # no room for the runtime DiT flow cache (NPU OOM in
+        # _split_flow_cache: 438 MiB request vs 169 MiB free). Cap the KV at
+        # 1 GiB like stage 1; the code2wav KV is a small formality (the real
+        # streaming state lives in the flow/HiFT runtime caches).
+        kv_cache_memory_bytes: 1073741824
         additional_config:
           code2wav_enable_npu_graph: false
 
