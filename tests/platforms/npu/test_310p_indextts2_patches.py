@@ -141,6 +141,14 @@ def patch_env(monkeypatch: pytest.MonkeyPatch):
         IndexTTS2S2MelDecoder=FakeS2MelDecoder,
     )
 
+    # The BigVGAN Kaiser-sinc filter surface (patched to CPU at apply time)
+    _install_fake_module(monkeypatch, "vllm_omni.model_executor.models.common")
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.model_executor.models.common.alias_free_activation",
+        kaiser_sinc_filter1d=lambda cutoff, half_width, kernel_size: None,
+    )
+
     # Sibling patch modules referenced by the dispatch (only worker/qwen3_tts
     # branches are ever reached by the qwen3_tts arches; provide inert fakes so
     # any dispatch can resolve)
@@ -235,6 +243,30 @@ def test_apply_is_idempotent(patch_env):
     # Constructing through the once-wrapped init still forces the runtime
     FakeS2MelDecoder(vllm_config=object())
     assert FakeS2MelDecoder.constructed[0].s2mel_dit_bf16 is False
+
+
+def test_bigvgan_kaiser_filter_pinned_to_cpu(patch_env):
+    """BigVGAN preload builds Kaiser-sinc LowPassFilter buffers before the
+    module is moved on-device. The shared NPU branch mixed NPU and
+    default-device (CPU) tensors there; the 310P line must pin the filter
+    math to CPU so the buffers ride the module move instead.
+    """
+    from vllm_omni.model_executor.models.common import alias_free_activation
+
+    dispatch = patch_env.dispatch
+    dispatch.apply_model_patches(SimpleNamespace(model_arch="IndexTTS25S2MelDecoder"))
+
+    replaced = alias_free_activation.kaiser_sinc_filter1d
+    assert getattr(replaced, "_indextts2_310p_cpu_safe", False) is True
+
+    filt = replaced(cutoff=0.33, half_width=0.08, kernel_size=24)
+    assert filt.shape == (1, 1, 24)
+    assert filt.dtype == torch.float32
+    assert str(filt.device) == "cpu"
+
+    # Idempotent: re-applying must keep the same replacement object.
+    patch_env.indextts2.apply_indextts2_310p_patches()
+    assert alias_free_activation.kaiser_sinc_filter1d is replaced
 
 
 def test_wrapper_preserves_vllm_config_signature(patch_env):
