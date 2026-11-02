@@ -159,6 +159,7 @@ def _install_sana_wm_patch_fakes(monkeypatch: pytest.MonkeyPatch, registry_calls
         monkeypatch,
         "vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm",
         SanaWmPipeline=FakeSanaWmPipeline,
+        SANA_WM_STAGE1_PROMPT_CHANNELS=2304,
         get_sana_wm_pre_process_func=lambda od_config: (lambda req: req),
     )
     _install_fake_module(monkeypatch, "vllm_omni")

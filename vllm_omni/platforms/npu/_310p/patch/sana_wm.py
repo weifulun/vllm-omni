@@ -48,6 +48,7 @@ from typing import Any
 import torch
 
 from vllm_omni.diffusion.models.sana_wm.pipeline_sana_wm import (
+    SANA_WM_STAGE1_PROMPT_CHANNELS,
     SanaWmPipeline,
     get_sana_wm_pre_process_func,
 )
@@ -140,10 +141,10 @@ class _SanaWm310P(SanaWmPipeline):
             select_index = [0] + list(range(-model_max_length + 1, 0))
             hidden_states = hidden_states[:, select_index]
             attention_mask = attention_mask[:, select_index]
-        if hidden_states.shape[-1] != 2304:
+        if hidden_states.shape[-1] != SANA_WM_STAGE1_PROMPT_CHANNELS:
             raise ValueError(
                 "Sana-WM Stage-1 Gemma hidden size mismatch: expected "
-                f"2304, got {hidden_states.shape[-1]}."
+                f"{SANA_WM_STAGE1_PROMPT_CHANNELS}, got {hidden_states.shape[-1]}."
             )
         prompt_attention_mask = attention_mask.to(device=device, dtype=torch.float32)
         if bool(prompt_attention_mask.all()):
