@@ -31,8 +31,10 @@ Invariants enforced here:
 * Chain-1 OOM downgrade (lead-fixed order): when the chip's 21589 MB budget
   is exceeded, ``FLUX2KLEIN_310P_ENCODER_CPU=1`` pins the Qwen3 text
   encoder on host memory (same playbook as model-qwenimg21 M8/R12); the
-  wrapper moves it back after pipeline construction.  Chain-2 (SP=2) stays
-  gated on the task-5/task-7 HCCL validation.
+  wrapper moves it back after pipeline construction.  Chain-2 (SP=2) uses the
+  intra-card HCCS chip pair (supported link; feasibility judged against the
+  task-10 HCCL topology table's intra-card pair bandwidth, falling back to
+  CPU-offload when insufficient).
 * VAE decode is forced onto the diffusers tiling/slicing path before the
   pipeline is loaded: the untiled 1024^2 decode peak is 8 GB+ of activations,
   which does not fit the 24 GB per-chip budget with weights resident
@@ -45,9 +47,12 @@ Component placement (logged at startup, matches the pipeline's own
   mode requires ``seq_len % sp == 0`` and ``heads % ulysses_degree == 0``).
 * ``text_encoder`` (Qwen3ForCausalLM) and ``vae`` (AutoencoderKLFlux2):
   replicated on every rank's local chip, forward-per-rank.  The 4B t2i
-  baseline therefore fits on a single 310P chip (24 GB); SP=2 scale-out is
-  the memory headroom path and is gated on the task-5/task-7 HCCL
-  validation (COMPARISON-POLICY.md section 4), not assumed here.
+  baseline fits on a single 310P chip (chip0 budget 21589 MB per the
+  mount recipe, with a thin activation margin); SP=2 scale-out uses the
+  two chips of ONE Duo card over the intra-card HCCS link (supported,
+  standard path) - feasibility is judged against the task-10 HCCL topology
+  table's intra-card pair bandwidth, cross-card (PCIe) SP stays a separate
+  task-5/task-7 validation scope.
 """
 
 from __future__ import annotations
@@ -226,7 +231,8 @@ def _log_placement_plan(od_config: Any) -> None:
         "[310P][flux2-klein] dtype=fp16 attention=TORCH_SDPA vae_tiling=forced | parallel: tp=%s "
         "sp=%s (ulysses=%s ring=%s allgather=%s) | placement: transformer sharded across the "
         "TP/SP group; text_encoder (Qwen3) and vae (AutoencoderKLFlux2) replicated per rank "
-        "on each rank's local chip; SP>1 requires task-5/task-7 HCCL validation first.",
+        "on each rank's local chip; intra-card SP=2 rides HCCS (standard); "
+        "cross-card SP awaits task-5/task-7 PCIe validation.",
         tp,
         sp,
         ulysses,
