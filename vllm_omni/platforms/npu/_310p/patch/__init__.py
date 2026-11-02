@@ -8,6 +8,9 @@ from __future__ import annotations
 _WORKER_PATCHED = False
 _QWEN3_TTS_TALKER_ARCH = "Qwen3TTSTalkerForConditionalGeneration"
 _QWEN3_TTS_CODE2WAV_ARCH = "Qwen3TTSCode2Wav"
+_COSYVOICE3_MODEL_ARCH = "CosyVoice3Model"
+_COSYVOICE3_TALKER_STAGE = "cosyvoice3_talker"
+_COSYVOICE3_CODE2WAV_STAGE = "cosyvoice3_code2wav"
 
 
 def apply_patches() -> None:
@@ -33,3 +36,16 @@ def apply_model_patches(model_config) -> None:
         from vllm_omni.platforms.npu._310p.patch.qwen3_tts import apply_code2wav_patches
 
         apply_code2wav_patches()
+    elif model_arch == _COSYVOICE3_MODEL_ARCH:
+        # Both CosyVoice3 stages resolve the same model class; the stage
+        # discriminator is ``model_config.model_stage`` (set per stage by the
+        # stage runtime).
+        model_stage = getattr(model_config, "model_stage", None)
+        if model_stage == _COSYVOICE3_TALKER_STAGE:
+            from vllm_omni.platforms.npu._310p.patch.cosyvoice3 import apply_talker_310p_patches
+
+            apply_talker_310p_patches()
+        elif model_stage == _COSYVOICE3_CODE2WAV_STAGE:
+            from vllm_omni.platforms.npu._310p.patch.cosyvoice3 import apply_code2wav_310p_patches
+
+            apply_code2wav_310p_patches()

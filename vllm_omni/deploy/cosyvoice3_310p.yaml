@@ -1,0 +1,24 @@
+# CosyVoice3-0.5B on Ascend 310P (Atlas 300I Duo), single-chip TP1.
+#
+# The 310P line is an FP16 line: vLLM's stage defaults fall back to the
+# checkpoint/config dtype (BFloat16 for Qwen2-class talkers), and 310P aclnn
+# rejects DT_BFLOAT16 (EZ1001).  ``dtype: float16`` pins both stages:
+#
+#   * stage 0 (talker, LLM_AR) — every parameter is constructed by the vLLM
+#     engine at the deploy dtype, so FP16 applies to the Qwen2 backbone and
+#     the talker-specific embeddings/decoders.
+#   * stage 1 (code2wav) — the flow/hift checkpoints are loaded at their
+#     native dtype outside the engine's weight machinery; the 310P patch
+#     (vllm_omni/platforms/npu/_310p/patch/cosyvoice3.py) forces them to FP16
+#     regardless, this pin keeps the two sides consistent.
+#
+# On the v0.32.0 line the NPU worker selects the MRV1 runner, so no runner
+# selection is overridden here.  Stage 0 keeps the base config's
+# ``enforce_eager: false``: the talker's model-owned RAS sampling is eager
+# torch (no ACL-graph capture), matching the 310P precedent for Qwen3-TTS /
+# VoxCPM2 where the AR side stays engine-managed.
+#
+# Usage on the 310P card:
+#   vllm serve <cosyvoice3 model dir> --deploy-config vllm_omni/deploy/cosyvoice3_310p.yaml
+base_config: cosyvoice3.yaml
+dtype: float16
