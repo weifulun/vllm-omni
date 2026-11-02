@@ -333,10 +333,12 @@ def _install_encoder_cpu_guard() -> None:
 
         _pl.from_pretrained_with_prefetch = _guarded_from_pf
 
+    # NOTE: the pipeline defines _get_qwen3_prompt_embeds as a @staticmethod
+    # (no self); the wrap must keep the plain-function arity or the call
+    # sites in the pipeline break.
     _orig_embeds = getattr(Flux2KleinPipeline, "_get_qwen3_prompt_embeds", None)
 
     def _get_qwen3_prompt_embeds_310p(
-        self: Any,
         text_encoder: Any,
         tokenizer: Any,
         prompt: Any,
@@ -348,7 +350,6 @@ def _install_encoder_cpu_guard() -> None:
         target = device
         device = _encoder_cpu_retarget(getattr(text_encoder, "device", None), device)
         out = _orig_embeds(
-            self,
             text_encoder,
             tokenizer,
             prompt,
