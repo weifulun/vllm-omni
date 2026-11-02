@@ -31,12 +31,12 @@ model class (``CosyVoice3Model``), dispatched on ``model_stage``:
   vLLM-Ascend Gumbel variant (``exponential_`` + ``argmax``) is the
   established NPU-safe replacement (used by the Qwen3-TTS 310P CodePredictor
   override and by ``AscendSampler310`` itself).
-* **S3 speech-tokenizer pinned to CPU** — ``s3tokenizer`` loads its PyTorch
-  model onto ``current_omni_platform.get_torch_device()``; on 310P that
-  pushes the reference-audio encoder through the 310P dynamic-TBE
-  compilation gap family (research 012).  The model is tiny and runs once
-  per reference utterance, so it stays eager on CPU — the same
-  "preprocessing pinned CPU" rule the VoxCPM2 310P patch applies.
+* **S3 speech-tokenizer pinned to CPU** — the primary guard lives in the
+  model file itself (``CosyVoice3MultiModalProcessor._load_s3_model`` falls
+  back to CPU on 310P, every process: the encoder's complex64 RoPE buffer
+  is unsupported by the 310P aclnn backend, and the path also runs in the
+  main-process InputProcessor which the worker patch never reaches).  This
+  patch re-pins the worker-side loader as belt-and-braces.
 * **HiFT F0 predictor untouched** — upstream already keeps it on CPU in FP32
   for non-CUDA devices (``load_weights`` picks ``f0_device="cpu"`` when
   ``device.type != "cuda"``), and ``inference`` transfers the mel chunk to
