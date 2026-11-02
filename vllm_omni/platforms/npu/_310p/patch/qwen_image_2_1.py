@@ -5,27 +5,24 @@
 
 SKELETON STATUS (local prep, 2026-11-02)
 ----------------------------------------
-This file is the 310P adaptation hook for ``QwenImage21Pipeline``.  It is
-designed to be driven by one guarded entry point,
-``maybe_apply_diffusion_310p_patches(od_config)``, which is a no-op unless
-``is_310p()`` is True *and* ``od_config.model_class_name == "QwenImage21Pipeline"``.
+This file is the 310P adaptation hook for ``QwenImage21Pipeline``.
 
-Wiring (to be integrated on the machine phase, coordinated with the
-task-11 SDXL branch which needs the same hook):
+Integration contract (COMPARISON-POLICY.md §5, lead-approved 2026-11-02)
+-------------------------------------------------------------------------
+task-11 (SDXL) lands the registry-style diffusion 310P hook in
+``NPUOmniPlatform.init_diffusion_model_runner_runtime`` first
+(model_class_name -> [patch function]); this branch rebases on it and
+registers ONLY through this file -- it must NOT edit ``platform.py``.  The
+registry consumes the names below (``maybe_apply_diffusion_310p_patches``
+stays as the self-gated standalone entry point until the registry lands):
 
-    vllm_omni/platforms/npu/platform.py :: NPUOmniPlatform
-        .init_diffusion_model_runner_runtime(vllm_config, od_config, device)
-            -> after the MiniMax patches:
-                from vllm_omni.platforms.npu._310p.patch.qwen_image_2_1 import (
-                    maybe_apply_diffusion_310p_patches,
-                )
-                maybe_apply_diffusion_310p_patches(od_config)
+    MODEL_ARCH = "QwenImage21Pipeline"
+    apply_patch = apply_qwen_image_2_1_310p_patches
 
-Why this hook: ``apply_model_patches(model_config)`` only runs inside the AR
-``OmniNPUModelRunner.load_model``; diffusion pipelines are built by
-``DiffusionModelRunner.load_model`` which calls
-``init_diffusion_model_runner_runtime`` first.  The SDXL risk list (task-11)
-confirms the same convention for 310P diffusion.
+Why this hook at all: ``apply_model_patches(model_config)`` only runs inside
+the AR ``OmniNPUModelRunner.load_model``; diffusion pipelines are built by
+``DiffusionModelRunner.load_model``, which calls
+``init_diffusion_model_runner_runtime`` first (same convention as task-11).
 
 Code-level findings that shape this patch (v0.32.0, branch feat/310p-qwen-image-2.1)
 --------------------------------------------------------------------------------------
@@ -69,7 +66,10 @@ from vllm_omni.platforms.npu._310p import is_310p
 
 logger = logging.getLogger(__name__)
 
-_MODEL_ARCH = "QwenImage21Pipeline"
+# Registry contract (COMPARISON-POLICY.md §5): the task-11 platform.py hook
+# maps model_class_name -> patch function; this file registers the entry
+# below and nothing else.
+MODEL_ARCH = "QwenImage21Pipeline"
 
 # Env knobs (all checked once at patch time; machine-phase A/B experiments use
 # them instead of editing code):
@@ -287,9 +287,19 @@ def apply_qwen_image_2_1_310p_patches(od_config: Any) -> None:
 
 
 def maybe_apply_diffusion_310p_patches(od_config: Any) -> None:
-    """Guarded entry point for ``init_diffusion_model_runner_runtime``."""
+    """Self-gated standalone entry point.
+
+    No-op unless ``is_310p()`` is True *and* ``model_class_name == MODEL_ARCH``.
+    Once the task-11 registry hook lands in ``init_diffusion_model_runner_runtime``
+    this file is registered via ``(MODEL_ARCH, apply_patch)`` and the registry
+    drives the same function; keep both paths for the rebase window.
+    """
     if not is_310p():
         return
-    if getattr(od_config, "model_class_name", None) != _MODEL_ARCH:
+    if getattr(od_config, "model_class_name", None) != MODEL_ARCH:
         return
     apply_qwen_image_2_1_310p_patches(od_config)
+
+
+# Registry-facing alias (COMPARISON-POLICY.md §5).
+apply_patch = apply_qwen_image_2_1_310p_patches
