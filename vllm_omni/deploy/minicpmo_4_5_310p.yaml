@@ -1,0 +1,55 @@
+# 310P overlay for MiniCPM-o 4.5 (Ascend CANN 9.1.0, FP16-only, task-8).
+#
+# Base: minicpmo_4_5.yaml (910 tuning). This overlay:
+#   * forces FP16 (POLICY section 2: 310P has no BF16 path);
+#   * places the three stages on one Duo card (stage 0 on both chips at TP2,
+#     stage 1 on chip 0, stage 2 on chip 1 — devices are container-local
+#     torch-npu indexes; mount-recipe.md section 2/3);
+#   * disables every NPUGraph adapter (not graph-safe on 310P, research/004;
+#     the _310p patch module defends against deployments that skip this file);
+#   * disables the Triton fused talker codec prelude (triton-ascend does not
+#     target 310P, research/003; the _310p patch also forces the process latch);
+#   * right-sizes the per-chip memory budget for the measured 21589 MiB
+#     usable per chip (see RISKS.md "VRAM budget").
+#
+# Real-device TODO(310P-real) knobs that are intentionally left at their base
+# values until first boots: stage 0 PIECEWISE / stage 1 FULL_DECODE_ONLY
+# cudagraph modes (the 310P model runner owns graph capture; flip to
+# enforce_eager: true on a capture failure) and stage 1 speculative_config
+# (K=8 multi-frame decode; fallback is dropping it — one codec frame per
+# step).
+
+base_config: minicpmo_4_5.yaml
+dtype: float16
+
+stages:
+  - stage_id: 0
+    tensor_parallel_size: 2
+    devices: "0,1"
+    gpu_memory_utilization: 0.68
+    max_model_len: 8192
+  - stage_id: 1
+    devices: "0"
+  - stage_id: 2
+    devices: "1"
+
+platforms:
+  npu:
+    stages:
+      - stage_id: 0
+        gpu_memory_utilization: 0.68
+        additional_config:
+          encoder_enable_npu_graph: false
+      - stage_id: 1
+        kv_cache_memory_bytes: 1073741824
+      - stage_id: 2
+        additional_config:
+          code2wav_enable_npu_graph: false
+
+connectors:
+  connector_of_shared_memory:
+    extra:
+      talker_codec_fused_prelude: false
+      enable_hift_graph: false
+      enable_cfm_graph: false
+      enable_code2wav_encoder_graph: false
