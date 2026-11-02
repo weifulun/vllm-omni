@@ -21,7 +21,16 @@ fully eager — the same porting pattern as ``sdxl.py`` / ``qwen3_tts.py``:
 * attention goes through the global explicit math SDPA decomposition
   (``attention.py``): AuK's single attention site calls
   ``F.scaled_dot_product_attention`` with an additive key-padding bias
-  (``[B, 1, 1, K]``, -inf for padded keys), which the math path handles.
+  (``[B, 1, 1, K]``, -inf for padded keys), which the math path handles;
+* the BigVGAN-flow VAE's Kaiser-sinc filter taps are pinned to CPU: the
+  diffusion loader constructs the pipeline inside a ``torch.device`` context
+  (``diffusers_loader._init_from_load_format``), so device-less tensor
+  creation in ``_kaiser_sinc_filter`` would default to the NPU, and
+  ``aten::kaiser_window`` has no NPU kernel on the CANN 9.1.0 / torch_npu
+  build (observed on 310P: DispatchStub ``missing kernel for npu`` abort
+  during AuKVAE construction).  The taps are a constant buffer the pipeline
+  moves to the device anyway (``AuKVAE.from_config(...).to(device=...)``),
+  so CPU construction is numerically identical.
 
 No stage-0 (frozen Qwen2.5-Omni thinker encoder) patch is needed: it runs the
 standard vLLM AR worker path with the generic 310P worker patch,
@@ -52,6 +61,30 @@ __all__ = [
 ]
 
 
+def _patch_auk_vae_kaiser_window() -> None:
+    """Pin the VAE's Kaiser-sinc filter taps to CPU construction.
+
+    Called before ``AuKPipeline.__init__`` (the VAE is built inside it).
+    Idempotent; safe on non-310P hosts too (CPU taps are identical).
+    """
+    from vllm_omni.diffusion.models.auk import auk_vae
+
+    if getattr(auk_vae, "_auk_310p_kaiser_patch", False):
+        return
+    original = auk_vae._kaiser_sinc_filter
+
+    def _cpu_kaiser_sinc_filter(cutoff: float, half_width: float, kernel_size: int) -> torch.Tensor:
+        with torch.device("cpu"):
+            return original(cutoff, half_width, kernel_size)
+
+    auk_vae._kaiser_sinc_filter = _cpu_kaiser_sinc_filter
+    auk_vae._auk_310p_kaiser_patch = True
+    logger.info(
+        "[310P] AuKVAE Kaiser-sinc filter taps pinned to CPU "
+        "(no NPU kernel for aten::kaiser_window on this torch_npu build)."
+    )
+
+
 class _AuK310P(AuKPipeline):
     """AuK pipeline specialized for the 310P NPU path.
 
@@ -65,6 +98,7 @@ class _AuK310P(AuKPipeline):
     """
 
     def __init__(self, *, od_config, prefix: str = "") -> None:
+        _patch_auk_vae_kaiser_window()
         super().__init__(od_config=od_config, prefix=prefix)
         if self.cudagraph_wrapper.enabled:
             self.cudagraph_wrapper.enabled = False

@@ -80,6 +80,21 @@ def _install_auk_fakes(monkeypatch: pytest.MonkeyPatch):
         "vllm_omni.diffusion.models.auk",
     ):
         monkeypatch.setitem(sys.modules, name, _install_fake_module(monkeypatch, name))
+    # Fake VAE module whose filter taps are built without an explicit device,
+    # mirroring the real _kaiser_sinc_filter (device-less tensor creation).
+    calls = {"n": 0}
+
+    def _fake_kaiser_sinc_filter(cutoff: float, half_width: float, kernel_size: int) -> torch.Tensor:
+        calls["n"] += 1
+        return torch.ones(1, 1, kernel_size, dtype=torch.float32)
+
+    auk_vae = _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.auk.auk_vae",
+        _kaiser_sinc_filter=_fake_kaiser_sinc_filter,
+    )
+    auk_vae._kaiser_calls = calls
+    sys.modules["vllm_omni.diffusion.models.auk"].auk_vae = auk_vae
     registrations: list[dict] = []
     monkeypatch.setitem(
         sys.modules,
@@ -232,6 +247,33 @@ def test_dispatch_routes_auk_pipeline(monkeypatch):
     calls.clear()
     init.apply_diffusion_310p_patches(_fake_od_config(model_class_name="StableDiffusionXLPipeline"))
     assert calls == ["attention", "sdxl"]
+
+
+def test_auk310p_pins_kaiser_filter_to_cpu(monkeypatch):
+    """The VAE's Kaiser-sinc taps must be built on CPU.
+
+    Inside the NPU device context used by the diffusion loader, the real
+    ``_kaiser_sinc_filter`` would create NPU tensors and dispatch
+    ``aten::kaiser_window`` (no NPU kernel on this torch_npu build ->
+    DispatchStub abort).  The 310P subclass must install the CPU-pinned
+    wrapper before the VAE is constructed.
+    """
+    module, _ = _load_auk_patch(monkeypatch)
+    auk_vae = sys.modules["vllm_omni.diffusion.models.auk.auk_vae"]
+    original = auk_vae._kaiser_sinc_filter
+
+    module._AuK310P(od_config=_fake_od_config(enforce_eager=True))
+
+    assert auk_vae._auk_310p_kaiser_patch is True
+    assert auk_vae._kaiser_sinc_filter is not original
+    # Idempotent: constructing a second pipeline must not re-wrap.
+    first = auk_vae._kaiser_sinc_filter
+    module._AuK310P(od_config=_fake_od_config(enforce_eager=True))
+    assert auk_vae._kaiser_sinc_filter is first
+    # The wrapper forces CPU tensor creation (the fake builds device-less
+    # tensors, mirroring the real filter).
+    taps = auk_vae._kaiser_sinc_filter(0.5, 0.6, 12)
+    assert taps.device.type == "cpu"
 
 
 def test_dispatch_env_disable(monkeypatch):
