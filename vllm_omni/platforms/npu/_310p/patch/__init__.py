@@ -36,6 +36,13 @@ _DIFFUSION_310P_PATCH_MODULES: dict[str, list[str]] = {
     # also knows the longer ``Cosmos3OmniDiffusersPipeline`` name.
     "Cosmos3OmniDiffusersPipeline": ["vllm_omni.platforms.npu._310p.patch.cosmos3_edge"],
     "Cosmos3OmniPipeline": ["vllm_omni.platforms.npu._310p.patch.cosmos3_edge"],
+    # HiDream-O1-Image (task-28): the unified Qwen3-VL-based flow-matching
+    # pipeline; 310P invariants (FP16 pin, CPU flow-matching scheduler, CPU
+    # RoPE table / timestep features, attention + cache + quant gates) live
+    # in the dedicated module.  No separate encoder/VAE: pixels are emitted
+    # directly as 32x32 RGB patches (encoder-pin and VAE-tiling invariants
+    # are N/A by construction - see the module docstring).
+    "HiDreamO1ImagePipeline": ["vllm_omni.platforms.npu._310p.patch.hidream_o1_image"],
 }
 
 
