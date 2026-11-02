@@ -68,6 +68,8 @@ _PATCHED = False
 _ORIGINAL_TORCH_CROSS: Any = None
 # Effective "never tile vertically" threshold for the LTX-2 VAE (pixels).
 _VAE_NO_VERTICAL_TILE_MIN_HEIGHT = 10_000_000
+# Optional benchmark timing file (JSON lines), see _SanaWm310P._install_timing_hooks.
+_TIMING_FILE_ENV = "VLLM_OMNI_310P_SANA_WM_TIMING_FILE"
 
 __all__ = [
     "_SanaWm310P",
@@ -216,6 +218,7 @@ class _SanaWm310P(SanaWmPipeline):
             )
         self._install_310p_rope_apply()
         self._fixup_vae_tiling_310p()
+        self._install_timing_hooks()
         if self.text_encoder is not None and not _encoder_on_npu():
             # Preprocessing-only module: keep it off the 310P NPU.
             self.text_encoder.to(device=_CPU_DEVICE, dtype=_RUNTIME_DTYPE)
@@ -249,6 +252,63 @@ class _SanaWm310P(SanaWmPipeline):
                 "[310P] SANA-WM: real-arithmetic RoPE apply installed on %d attention module(s).",
                 installed,
             )
+
+    def _install_timing_hooks(self) -> None:
+        """Optional per-phase wall timing for the benchmark runner.
+
+        The engine builds its model replica internally, so the runner cannot
+        wrap the live instance from outside; when
+        ``VLLM_OMNI_310P_SANA_WM_TIMING_FILE`` names a path, this instance
+        appends one JSON line per call (``{"phase": ..., "s": ...}``) to it.
+        DiT/VAE calls bracket an NPU sync so the wall includes kernel
+        completion; the CPU-pinned encoder needs none.
+        """
+        import json
+        import os
+        import time
+
+        path = os.environ.get(_TIMING_FILE_ENV)
+        if not path:
+            return
+
+        def _sync() -> None:
+            npu = getattr(torch, "npu", None)
+            if npu is not None:
+                try:
+                    npu.synchronize()
+                except Exception:  # noqa: BLE001 - timing must never break the run
+                    pass
+
+        def _record(phase: str, t0: float) -> None:
+            try:
+                with open(path, "a", encoding="utf-8") as fh:
+                    fh.write(json.dumps({"phase": phase, "s": round(time.perf_counter() - t0, 4)}) + "\n")
+            except OSError:
+                logger.warning("[310P] SANA-WM timing file write failed; phase timing lost.")
+
+        def _wrap(module_obj: Any, attr: str, phase: str, sync: bool) -> None:
+            orig = getattr(module_obj, attr)
+
+            def timed(*args: Any, **kwargs: Any) -> Any:
+                if sync:
+                    _sync()
+                t0 = time.perf_counter()
+                out = orig(*args, **kwargs)
+                if sync:
+                    _sync()
+                _record(phase, t0)
+                return out
+
+            setattr(module_obj, attr, timed)
+
+        transformer = getattr(self, "transformer", None)
+        if transformer is not None:
+            _wrap(transformer, "forward", "dit", sync=True)
+        vae = getattr(self, "vae", None)
+        if vae is not None:
+            _wrap(vae, "decode", "vae_decode", sync=True)
+        if self.text_encoder is not None:
+            _wrap(self.text_encoder, "forward", "encoder", sync=False)
 
     def _fixup_vae_tiling_310p(self) -> None:
         """310P: disable the LTX-2 VAE's *vertical* tiling in tiled decode.
