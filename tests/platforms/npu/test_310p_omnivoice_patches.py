@@ -164,7 +164,11 @@ def _load_patch(monkeypatch: pytest.MonkeyPatch, is_310p_value: bool):
     return patch, gen_mod, sdpa_mod
 
 
-def _od_config(model_class_name: str = "OmniVoicePipeline"):
+# The *resolved* od_config.model_class_name is the architecture name from
+# config.json ("OmniVoice"); the registry also exposes the class-name spelling
+# "OmniVoicePipeline".  Both must pass the gate (machine-verified on 126/C3:
+# the resolved value is "OmniVoice").
+def _od_config(model_class_name: str = "OmniVoice"):
     return SimpleNamespace(model_class_name=model_class_name)
 
 
@@ -175,13 +179,14 @@ def _od_config(model_class_name: str = "OmniVoicePipeline"):
 
 def test_should_patch_gating(monkeypatch):
     patch, _, _ = _load_patch(monkeypatch, True)
+    assert patch.should_patch(_od_config("OmniVoice")) is True
     assert patch.should_patch(_od_config("OmniVoicePipeline")) is True
     assert patch.should_patch(_od_config("QwenImage21Pipeline")) is False
     assert patch.should_patch(SimpleNamespace(model_class_name=None)) is False
     # Off-310P the gate must refuse even for the right model.  The patch
     # module bound ``is_310p`` into its own namespace at load time.
     monkeypatch.setattr(patch, "is_310p", lambda *a, **k: False)
-    assert patch.should_patch(_od_config("OmniVoicePipeline")) is False
+    assert patch.should_patch(_od_config("OmniVoice")) is False
 
 
 def test_entry_noop_off_310p(monkeypatch):

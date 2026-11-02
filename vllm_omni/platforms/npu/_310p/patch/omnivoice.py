@@ -61,7 +61,14 @@ logger = logging.getLogger(__name__)
 
 # Registry contract (COMPARISON-POLICY.md §5): platform.py maps
 # model_class_name -> patch function through this entry point.
-MODEL_ARCH = "OmniVoicePipeline"
+#
+# Both registry keys resolve to the same pipeline class (diffusion/registry.py);
+# the *resolved* ``od_config.model_class_name`` is the architecture name from
+# config.json (``architectures: ["OmniVoice"]``), so the gate must accept both
+# spellings.  Machine-verified on 126/C3 (2026-11-03): the resolved value is
+# "OmniVoice".
+MODEL_ARCH = "OmniVoice"
+MODEL_ARCH_NAMES = ("OmniVoice", "OmniVoicePipeline")
 
 _SDPA_DENSE_LIMIT_BYTES = 2 * 1024 * 1024 * 1024
 _SDPA_CHUNK_SIZE = 512
@@ -78,7 +85,7 @@ _NPU_RNG_OK: bool | None = None  # probe result cache (None = not probed)
 def should_patch(od_config: Any) -> bool:
     """True only on 310P hardware for the OmniVoice diffusion pipeline."""
     model_arch = getattr(od_config, "model_class_name", None)
-    if model_arch != MODEL_ARCH:
+    if model_arch not in MODEL_ARCH_NAMES:
         return False
     return is_310p()
 
