@@ -267,6 +267,20 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
         set_mc2_mask(vllm_config, device)
 
+        # 310P diffusion model patches (task-19 MOSS-Image).  Self-gated:
+        # no-op off 310P, under the kill switch, or for other model class
+        # names (see the entry point docstring).  Direct call for the rebase
+        # window -- the registry hook that dispatches per-model 310P
+        # diffusion patches lands with task-11; until then the self-gated
+        # entry point is driven here so the 310P specialization (FP16
+        # runtime, CPU-pinned Qwen3.5 encoder, CPU loader construction,
+        # manual SDPA, VAE tiling) is active on 310P.
+        from vllm_omni.platforms.npu._310p.patch.mossimage import (
+            maybe_apply_diffusion_310p_patches,
+        )
+
+        maybe_apply_diffusion_310p_patches(od_config)
+
     @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/deploy"
