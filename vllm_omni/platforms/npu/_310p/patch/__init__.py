@@ -36,6 +36,12 @@ _DIFFUSION_310P_PATCH_MODULES: dict[str, list[str]] = {
     # also knows the longer ``Cosmos3OmniDiffusersPipeline`` name.
     "Cosmos3OmniDiffusersPipeline": ["vllm_omni.platforms.npu._310p.patch.cosmos3_edge"],
     "Cosmos3OmniPipeline": ["vllm_omni.platforms.npu._310p.patch.cosmos3_edge"],
+    # LongCat-Video-Avatar (task-34): 15.853B DiT - FP16 (31.7 GB) does not
+    # fit one 21589 MB chip and the native MVP rejects context parallel, so
+    # the official base_model_int8 checkpoint (POLICY section-2 fallback)
+    # runs TP1 with UMT5/Whisper CPU-pinned, chunked head-grouped attention,
+    # CPU RoPE tables, and compute-dtype norm/modulation.
+    "LongCatVideoAvatarPipeline": ["vllm_omni.platforms.npu._310p.patch.longcat_video_avatar"],
 }
 
 
