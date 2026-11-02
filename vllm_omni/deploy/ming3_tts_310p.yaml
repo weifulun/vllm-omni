@@ -1,0 +1,53 @@
+# Ming-3.0-TTS-tiny (7.9B-A1.3B MoE, BailingMoeV3 backbone) on Ascend 310P,
+# single chip TP1, logical device 0 (task-29, model-ming3tiny).
+#
+# Thin overlay over the base single-stage deploy.  Two 310P deltas, both
+# under ``platforms.npu`` (the tag tree rejects Model Runner V2 on NPU in
+# _apply_platform_overrides, exactly as the CUDA recipe targets; the
+# single-stage async-chunk AR path runs on the legacy V1 data plane — the
+# same shape the Qwen3-TTS 310P line uses via its platforms.npu block):
+#
+#   * ``model_runner: v1`` — MRv2 is CUDA/H100 recipe; the NPU platform
+#     worker has the V1 async-chunk data plane only (stage_config.py
+#     raises NotImplementedError for v2 on npu, tag AND main).
+#   * ``dtype: float16`` — 310P has no BF16 (AclNN EZ1001 exposes no
+#     DT_BFLOAT16); the base pins bfloat16 (CUDA recipe).  FP16 weights are
+#     ~16.7 GiB on a ~21.6 GiB chip, the first tier per the 310P memory
+#     ladder (INT8 would need offline W8A8 pre-quant of a custom arch and
+#     is the fallback only if FP16 does not fit at runtime).
+#   * stage 0 runtime pins — ``enforce_eager: true`` (single-chip budget
+#     forbids CUDA graph capture; the node-wide 310P TTS rule, Qwen3-TTS /
+#     VoxCPM2 / MOSS-TTS / Ming dense all pin eager), ``max_num_seqs: 1``
+#     (recipe is single-stream TTS; the base 64 would inflate the mamba/KDA
+#     state pool and the batched-admission wait on a chip that cannot
+#     afford it), ``gpu_memory_utilization: 0.95`` (budget must cover
+#     16.7 GiB weights + KV + KDA/conv state pools + activations), and
+#     ``cudagraph_mode: NONE`` (dead config under eager; pinned so the
+#     contract test can assert the resolved deploy).
+#
+# The BailingMoeV3 KDA layers' FLA Triton kernels are replaced at worker
+# patch time by the pure-torch 310P ops
+# (vllm_omni/platforms/npu/_310p/patch/ming3_tts_kda.py); the model-class
+# FP16/CFM-graph pins live in .../patch/ming3_tts.py.  Kill switch:
+# VLLM_OMNI_310P_MING3TTS_PATCH=0.
+#
+# Usage on the 310P card:
+#   vllm serve <Ming-3.0-tts-tiny dir> \
+#     --deploy-config vllm_omni/deploy/ming3_tts_310p.yaml
+base_config: ming3_tts.yaml
+dtype: float16
+# Local checkpoints ship HF custom config code (configuration_*.py); the
+# base pins trust_remote_code=false (HF-ID recipe, where the wrapper loads
+# configs itself).  Serving a local model directory trips vllm's ModelConfig
+# custom-code guard, so this line enables it explicitly.
+trust_remote_code: true
+platforms:
+  npu:
+    model_runner: v1
+    stages:
+      - stage_id: 0
+        enforce_eager: true
+        max_num_seqs: 1
+        gpu_memory_utilization: 0.95
+        compilation_config:
+          cudagraph_mode: NONE
