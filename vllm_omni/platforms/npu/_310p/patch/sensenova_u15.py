@@ -96,8 +96,10 @@ Component placement (logged at startup):
 from __future__ import annotations
 
 import importlib
+import inspect
 import logging
 import os
+import sys
 from typing import Any
 
 import torch
@@ -760,6 +762,30 @@ class _SenseNovaU15Overrides:
         )
 
 
+def _gate_stub_triton_kernel() -> None:
+    """Gate the fused qk-norm+RoPE Triton entry when the container's triton
+    package is a stub (127 C4 reality check).
+
+    The 127 C4 container ships no real triton package: vllm.triton_utils
+    synthesizes a stub module whose `jit` is an identity decorator, so
+    qk_norm_rope_kernel stays a plain Python function and `kernel[grid]`
+    raises TypeError at RUNTIME (127 C4: dummy it2i warmup died in
+    _project_and_rope -> fused_rmsnorm_rope triton_qk_norm_rope L200).
+    The upstream availability check only catches ImportError, so gate the
+    module-level entry here: None makes the transformer fall through to its
+    PyTorch qk-norm+RoPE path (the author's intended "unavailable" branch).
+    """
+    name = "vllm_omni.diffusion.models.sensenova_u1.fused_rmsnorm_rope"
+    module = sys.modules.get(name)
+    if module is None:
+        try:
+            module = importlib.import_module(name)
+        except ImportError:  # contract-test environment (module faked/absent)
+            return
+    if inspect.isfunction(getattr(module, "qk_norm_rope_kernel", None)):
+        module.triton_qk_norm_rope = None
+
+
 def _build_310p_pipeline_cls():
     """Materialize the 310P subclass at apply time (the heavy diffusion
     imports stay out of module import so contract tests run CPU-only)."""
@@ -783,6 +809,8 @@ def _build_310p_pipeline_cls():
                 lambda self: self.model.layers
             )
         SenseNovaU1ForCausalLM._layerwise_offload_blocks_attrs = ["layers"]
+
+    _gate_stub_triton_kernel()
 
     cls = type(
         "_SenseNovaU15Pipeline310P",

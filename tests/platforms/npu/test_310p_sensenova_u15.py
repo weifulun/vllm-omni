@@ -465,6 +465,45 @@ def test_lm_block_stack_declared_for_layerwise_offload(monkeypatch: pytest.Monke
     assert isinstance(vars(lm_cls).get("layers"), property)
 
 
+def test_stub_triton_kernel_is_gated(monkeypatch: pytest.MonkeyPatch):
+    """127 C4: no real triton package - vllm.triton_utils synthesizes a stub
+    module with an identity `jit`, so qk_norm_rope_kernel is a plain function
+    and `kernel[grid]` TypeErrors at runtime (dummy it2i warmup).  The gate
+    must neutralize the module-level entry so the transformer falls back to
+    its PyTorch qk-norm+RoPE path."""
+    _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+
+    fused = _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.sensenova_u1.fused_rmsnorm_rope",
+        qk_norm_rope_kernel=lambda *a, **k: None,  # plain function = stub JIT
+        triton_qk_norm_rope=lambda *a, **k: None,
+    )
+    module._gate_stub_triton_kernel()
+    assert fused.triton_qk_norm_rope is None
+
+
+def test_real_triton_kernel_is_not_gated(monkeypatch: pytest.MonkeyPatch):
+    """A genuine Triton JITFunction is subscriptable and must be left intact
+    (gate must not clobber a working kernel)."""
+    _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+
+    class _FakeJitKernel:
+        def __getitem__(self, grid):  # pragma: no cover - shape probe only
+            return self
+
+    fused = _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.models.sensenova_u1.fused_rmsnorm_rope",
+        qk_norm_rope_kernel=_FakeJitKernel(),
+        triton_qk_norm_rope=lambda *a, **k: None,
+    )
+    module._gate_stub_triton_kernel()
+    assert fused.triton_qk_norm_rope is not None
+
+
 def test_multi_chip_without_quant_is_not_patched_rejected(monkeypatch: pytest.MonkeyPatch):
     """A 2-chip FP16 split is a separate validation scope (TP1-only GO); the
     patch must not hard-fail it, only the quant tiers are gated."""
