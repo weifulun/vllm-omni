@@ -1,0 +1,36 @@
+# GLM-TTS 310P (Atlas 300I Duo / Ascend 310P) deployment overlay.
+#
+# 310P is the FP16 line:
+#   * stage 0 (GQA Llama 1.55B AR talker): dtype float16.  The base config
+#     pins bfloat16 for the 910B/GPU line ("~1.7x throughput on L4/A40");
+#     310P AclNN rejects DT_BFLOAT16 (EZ1001) — same wall as voxcpm/indextts
+#     L2 baselines.
+#   * stage 1 (flow-matching DiT): dtype float32 is KEPT (upstream intent:
+#     the 10-step Euler ODE accumulates half-precision rounding into audible
+#     hiss; float32 matches the reference implementation).  DT_FLOAT is in the
+#     310P supported dtype list; the attention dead-zone is handled by the
+#     model-level math-SDPA patch
+#     (vllm_omni/platforms/npu/_310p/patch/glm_tts.py), not by the overlay.
+#   * enforce_eager true on both stages: the official benchmark
+#     (tests/e2e/offline_inference/test_glm_tts_expansion.py) forces eager;
+#     NPUGraph capture on this image build is not the benchmark condition.
+#   * use_dit_cuda_graphs false: the CUDA-graph sampler is device-gated to
+#     "cuda" in code (auto-fallback on NPU), the overlay makes intent explicit.
+#
+# Everything else (two-stage topology, async-chunk connector, RAS sampling,
+# seed 42, sampling constraints) is inherited from glm_tts.yaml.
+#
+# Usage on the 310P card (single chip via ASCEND_RT_VISIBLE_DEVICES):
+#   vllm-omni serve /data/310p-weights/glm-tts \
+#     --deploy-config vllm_omni/deploy/glm_tts_310p.yaml \
+#     --omni --trust-remote-code
+base_config: glm_tts.yaml
+stages:
+  - stage_id: 0
+    dtype: float16
+    enforce_eager: true
+  - stage_id: 1
+    dtype: float32
+    enforce_eager: true
+    hf_overrides:
+      use_dit_cuda_graphs: false

@@ -8,6 +8,7 @@ from __future__ import annotations
 _WORKER_PATCHED = False
 _QWEN3_TTS_TALKER_ARCH = "Qwen3TTSTalkerForConditionalGeneration"
 _QWEN3_TTS_CODE2WAV_ARCH = "Qwen3TTSCode2Wav"
+_GLM_TTS_ARCH = "GLMTTSForConditionalGeneration"
 
 
 def apply_patches() -> None:
@@ -33,3 +34,9 @@ def apply_model_patches(model_config) -> None:
         from vllm_omni.platforms.npu._310p.patch.qwen3_tts import apply_code2wav_patches
 
         apply_code2wav_patches()
+    elif model_arch == _GLM_TTS_ARCH:
+        # Both GLM-TTS stages (AR + DiT generation) register under the same
+        # arch; the patch set is idempotent.
+        from vllm_omni.platforms.npu._310p.patch.glm_tts import apply_glm_tts_310p_patches
+
+        apply_glm_tts_310p_patches()
