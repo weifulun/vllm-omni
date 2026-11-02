@@ -209,6 +209,9 @@ def _offload_talker_embeddings_310p(worker) -> None:
     if _kill_switch_off():
         return
     model = getattr(worker, "model", None)
+    if model is None:
+        runner = getattr(worker, "model_runner", None)
+        model = getattr(runner, "model", None) if runner is not None else None
     if model is None or type(model).__name__ != _TALKER_ARCH_NAME:
         return
     moved = []
@@ -231,23 +234,30 @@ def _offload_talker_embeddings_310p(worker) -> None:
         )
 
 
-def _wrap_ar_load_model_310p() -> None:
-    """Run the talker embedding offload after the AR worker loads the model."""
+def _wrap_worker_profile_310p() -> None:
+    """Run the talker embedding offload right before the 310P memory profile.
+
+    ``NPUWorker310.determine_available_memory`` runs the dummy prefill and
+    sizes the KV pool from whatever is resident at that moment; the model
+    weights are already on the NPU and the profile call is a separate method
+    dispatch, so a class-level wrap installed here takes effect in the same
+    process. Other architectures pass through the hook untouched.
+    """
     try:
-        from vllm_omni.platforms.npu.worker import npu_ar_model_runner as _ar_module
+        from vllm_ascend._310p import worker_310p as _w310
     except ImportError:
-        return  # no AR worker in this environment (host contract tests)
-
-    if getattr(_ar_module.NPUARModelRunner, "_MM3_LOAD_WRAPPED", False):
+        return  # no 310P worker in this environment (host contract tests)
+    worker_cls = getattr(_w310, "NPUWorker310", None)
+    if worker_cls is None or getattr(worker_cls, "_MM3_PROFILE_WRAPPED", False):
         return
-    original = _ar_module.NPUARModelRunner.load_model
+    original = worker_cls.determine_available_memory
 
-    def load_model_310p(self, *args, **kwargs):
-        original(self, *args, **kwargs)
+    def determine_available_memory_310p(self) -> int:
         _offload_talker_embeddings_310p(self)
+        return original(self)
 
-    _ar_module.NPUARModelRunner.load_model = load_model_310p
-    _ar_module.NPUARModelRunner._MM3_LOAD_WRAPPED = True
+    worker_cls.determine_available_memory = determine_available_memory_310p
+    worker_cls._MM3_PROFILE_WRAPPED = True
 
 
 def apply_talker_patches() -> None:
@@ -299,7 +309,7 @@ def apply_talker_patches() -> None:
             "MiniMax Music 3 310P: embedding/LM-head fractal-NZ copies disabled "
             "(plain-fp16 F.linear seam); linear NZ conversion left in place"
         )
-    _wrap_ar_load_model_310p()
+    _wrap_worker_profile_310p()
 
     _TALKER_PATCHED = True
     logger.info(
