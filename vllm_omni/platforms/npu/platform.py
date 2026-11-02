@@ -267,6 +267,14 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
         set_mc2_mask(vllm_config, device)
 
+        # Self-gated 310P hook for the OmniVoice diffusion TTS pipeline
+        # (no-op off 310P or for any other model_class_name; idempotent).
+        from vllm_omni.platforms.npu._310p.patch.omnivoice import (
+            maybe_apply_omnivoice_310p_patches,
+        )
+
+        maybe_apply_omnivoice_310p_patches(od_config)
+
     @classmethod
     def get_default_stage_config_path(cls) -> str:
         return "vllm_omni/deploy"
