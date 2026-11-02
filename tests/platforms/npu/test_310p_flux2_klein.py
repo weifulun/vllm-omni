@@ -241,14 +241,37 @@ def test_numerical_cache_backends_are_disabled(monkeypatch: pytest.MonkeyPatch):
         assert od_config.cache_backend == "none", backend
 
 
-def test_quantization_is_rejected_lora_warns(monkeypatch: pytest.MonkeyPatch, caplog):
+def test_quantization_int8_accepted_as_second_tier(monkeypatch: pytest.MonkeyPatch, caplog):
+    """POLICY section 2: INT8 W8A8 is the sanctioned fallback tier
+    (research/009) - accepted with a loud warning, no raise."""
     _install_patch_fakes(monkeypatch)
     module = _load_flux2_klein_patch(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="unquantized"):
-        module.apply_diffusion_310p_patches(_make_od_config(quantization_config=SimpleNamespace(name="fp8")))
+    with caplog.at_level(logging.WARNING):
+        module.apply_diffusion_310p_patches(
+            _make_od_config(quantization_config=SimpleNamespace(name="int8"))
+        )
+    assert "second tier" in caplog.text
+    assert "int8" in caplog.text.lower()
 
-    module._APPLIED = False
+
+def test_quantization_non_int8_rejected(monkeypatch: pytest.MonkeyPatch):
+    """FP8/MXFP* give no 310P hardware benefit (research/009) -> rejected."""
+    _install_patch_fakes(monkeypatch)
+    module = _load_flux2_klein_patch(monkeypatch)
+
+    for method in ("fp8", "mxfp8", "convrot_int4"):
+        module._APPLIED = False
+        with pytest.raises(RuntimeError, match="rejects quantization"):
+            module.apply_diffusion_310p_patches(
+                _make_od_config(quantization_config=SimpleNamespace(name=method))
+            )
+
+
+def test_lora_warns(monkeypatch: pytest.MonkeyPatch, caplog):
+    _install_patch_fakes(monkeypatch)
+    module = _load_flux2_klein_patch(monkeypatch)
+
     with caplog.at_level(logging.WARNING):
         module.apply_diffusion_310p_patches(_make_od_config(lora_path="/tmp/lora"))
     assert "lora" in caplog.text.lower()

@@ -19,13 +19,21 @@ Invariants enforced here:
   kernels do not exist on 310P, and the platform's ``find_spec("mindiesd")``
   fallback cannot be trusted on this card.  An explicit request for a
   MindIE-SD-only backend fails at patch time with a clear error instead of
-  deep inside a kernel call.  (A native ``torch_npu`` fusion-attention
-  acceleration is a later A/B candidate, tracked with task-11's report.)
+  deep inside a kernel call.  The native ``torch_npu`` fusion-attention
+  candidate is retired: research/003 shows ``npu_fusion_attention`` is
+  officially limited to 950DT + A2 training series, unavailable on 310P.
 * Numerics-changing cache backends are disabled while the 310P path is
   unvalidated, so the same-seed reference comparison (COMPARISON-POLICY.md
   section 1) is not broken by step-skipping caches.
-* ``quantization_config`` must be unset: FP8/INT8 310P operator coverage is
-  out of scope for the t2i baseline.
+* Precision tiers (POLICY section 2, revised 2026-11-02): FP16 (no
+  ``quantization_config``) is the primary tier.  When weights exceed the
+  chip budget, the sanctioned second tier is INT8 W8A8 (method ``int8``,
+  DiffusionInt8Config online dynamic quantization through
+  ``torch_npu.npu_quant_matmul``, per-layer fallback of layers wider than
+  65535 to unquantized - research/009): accepted with a loud warning;
+  precision evidence against the FP16 baseline is mandatory in the
+  real-device report.  FP8/MXFP* (no 310P hardware benefit), ConvRot-INT4
+  (unvalidated) and bitsandbytes (CUDA-only) are rejected.
 * LoRA is accepted with a loud warning (out of scope for the parity
   baseline; weights differ from the reference run by design).
 * Chain-1 OOM downgrade (lead-fixed order): when the chip's 21589 MB budget
@@ -37,7 +45,7 @@ Invariants enforced here:
   CPU-offload when insufficient).
 * VAE decode is forced onto the diffusers tiling/slicing path before the
   pipeline is loaded: the untiled 1024^2 decode peak is 8 GB+ of activations,
-  which does not fit the 24 GB per-chip budget with weights resident
+  which does not fit the 21589 MB per-chip budget with weights resident
   (same finding as task-11's SDXL risk list).
 
 Component placement (logged at startup, matches the pipeline's own
@@ -143,6 +151,57 @@ def _disable_numerical_cache_backends(od_config: Any) -> None:
     )
     od_config.cache_backend = "none"
 
+
+def _quantization_method(quant_config: Any) -> str | None:
+    """Resolve the quantization method name from a QuantizationConfig object."""
+    getter = getattr(quant_config, "get_name", None)
+    if callable(getter):
+        try:
+            return getter()
+        except Exception:  # pragma: no cover - defensive, contract-level
+            pass
+    for attr in ("method", "name"):
+        value = getattr(quant_config, attr, None)
+        if isinstance(value, str):
+            return value
+    return None
+
+
+def _validate_quantization(od_config: Any) -> None:
+    """Precision-tier gate: FP16 primary, INT8 W8A8 sanctioned fallback only.
+
+    POLICY section 2 (revised 2026-11-02): FP16 is the first choice; when
+    weights do not fit the chip budget, INT8 is the fallback tier (no BF16,
+    no over-budget force-fitting, quantization config must be recorded in
+    the report).  research/009: on 310P only INT8 W8A8 has a hardware
+    benefit (npu_quant_matmul, 280 TOPS INT8 per card); FP8/MXFP* fall back
+    to FP16 matmul with no gain, ConvRot-INT4 NPU applicability is
+    unvalidated, bitsandbytes is CUDA-only.
+    """
+    quant_config = getattr(od_config, "quantization_config", None)
+    if quant_config is None:
+        return
+    method = _quantization_method(quant_config)
+    if method == "int8":
+        logger.warning(
+            "[310P][flux2-klein] quantization_config method=%r accepted as the "
+            "POLICY section-2 second tier (research/009): online dynamic INT8 "
+            "via npu_quant_matmul, layers with output dim > 65535 fall back to "
+            "unquantized (mixed-precision semantics). Precision evidence vs "
+            "the FP16 baseline is MANDATORY in the real-device report; no "
+            "upstream 310P diffusion INT8 precedent exists (first-run).",
+            method,
+        )
+        return
+    raise RuntimeError(
+        f"310P FLUX.2-klein rejects quantization method {method!r} "
+        f"(quantization_config={quant_config!r}): FP16 is the primary tier "
+        "(quantization_config unset); only the INT8 W8A8 fallback "
+        "(method='int8') is sanctioned on 310P (POLICY section 2, "
+        "research/009). FP8/MXFP* give no hardware benefit on 310P "
+        "(served with FP16 matmul); ConvRot-INT4 is unvalidated; "
+        "bitsandbytes is CUDA-only."
+    )
 
 def _check_heads_divisibility(od_config: Any) -> None:
     """Strict-Ulysses preflight: head count must divide the ulysses degree."""
@@ -286,12 +345,7 @@ def apply_diffusion_310p_patches(od_config: Any) -> None:
     _force_fp16(od_config)
     _validate_attention_selection(od_config)
     _disable_numerical_cache_backends(od_config)
-    quant_config = getattr(od_config, "quantization_config", None)
-    if quant_config is not None:
-        raise RuntimeError(
-            f"310P FLUX.2-klein baseline is unquantized; got quantization_config={quant_config!r}. "
-            "FP8/INT8 operator coverage on 310P is out of scope for the t2i reference baseline."
-        )
+    _validate_quantization(od_config)
     if getattr(od_config, "lora_path", None) is not None:
         logger.warning(
             "[310P][flux2-klein] lora_path=%r is out of scope for the 310P reference "
