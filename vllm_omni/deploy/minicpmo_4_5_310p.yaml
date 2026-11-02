@@ -32,10 +32,12 @@ stages:
     # retained caching-allocator blocks under the EH0012 no-op (aee740b99):
     # peak = base + dummy activations + retained cache, and the margin is what
     # funds the 8192-token KV check (0.57 GiB engine-side).
-    # boot10/11 (2026-11-03): 4096 -> 2048. The dummy-run activation high-water
-    # stays in the caching pool per TP rank (measured 14.5 GiB/rank on chip1);
-    # halving the dummy halves that retained pool and leaves the ~0.2-2 GiB
-    # headroom the stage-2 TTS flow cache needs on the shared chip.
+    # boot10-12 (2026-11-03): the dummy-run activation high-water stays in the
+    # caching pool per TP rank (measured 14.5 GiB/rank on chip1); a smaller
+    # dummy frees ~2 GiB on each shared chip for the stage-2 TTS flow cache.
+    # NOTE (boot12): this flat key is overridden AFTER parsing by the base
+    # overlay's platforms.npu.stages[0] entry (910B1 tuning: 8192); the
+    # effective override lives in the platforms section below.
     max_num_batched_tokens: 2048
     # Real-device first boot (128 C1, 2026-11-02): the base PIECEWISE
     # compiled decode fails on 310P — aclnnApplyRotaryPosEmbV2 gets a null
@@ -73,6 +75,14 @@ platforms:
     stages:
       - stage_id: 0
         gpu_memory_utilization: 0.75
+        # Real-device (128 C1, 2026-11-03, boot10-12): the base 910B1 tuning
+        # pins 8192 at THIS platform layer (applied after stage parsing, so it
+        # wins over the flat stage key). The 8192-token profile dummy leaves a
+        # 14.5 GiB/rank retained caching pool on each TP rank (measured via
+        # npu-smi proc-mem), which starves the co-located stage-2 code2wav flow
+        # cache (438 MiB request, 169 MiB free -> OOM). 2048 halves the dummy
+        # activation high-water and frees the headroom stage 2 needs on chip1.
+        max_num_batched_tokens: 2048
         additional_config:
           encoder_enable_npu_graph: false
       - stage_id: 1
@@ -88,18 +98,24 @@ platforms:
         kv_cache_memory_bytes: 1073741824
         additional_config:
           code2wav_enable_npu_graph: false
-          # Real-device (128 C1, 2026-11-03, boot10/11): the per-request
-          # estimator attention cache is fp32 by default (~0.44 GiB per
-          # request); token2wav_float16 runs the flow estimator attention in
-          # fp16 and halves the cache (438 MiB -> ~219 MiB), which is the
-          # difference between OOM and success on the chip shared with the
-          # Thinker TP2 rank. The bf16 variant is CUDA-only by design.
-          token2wav_float16: true
+          # NOTE: token2wav_float16 must live in the connectors section extra,
+          # not here: code2wav reads _extra_config() =
+          # stage_connector_config.extra (see boot12: the platform-layer copy
+          # never took effect).
 
 connectors:
   connector_of_shared_memory:
+    # The code2wav model reads _extra_config() = this connector extra dict
+    # (minicpmo_4_5_code2wav.py:1527). Runtime-only flags that must reach
+    # stage 2 belong HERE, not in the platform additional_config.
     extra:
       talker_codec_fused_prelude: false
       enable_hift_graph: false
       enable_cfm_graph: false
       enable_code2wav_encoder_graph: false
+      # Real-device (128 C1, 2026-11-03, boot10-12): the per-request estimator
+      # attention cache is fp32 by default (~0.44 GiB per request, the exact
+      # 438 MiB OOM in _split_flow_cache on the chip shared with the Thinker
+      # TP2 rank). float16 halves it to ~219 MiB. The bf16 variant is
+      # CUDA-only by design (platforms/npu raises on it).
+      token2wav_float16: true
