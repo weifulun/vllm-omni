@@ -1,0 +1,52 @@
+# VoxCPM2 310P streaming benchmark deploy (task-13 real-device phase).
+#
+# Standalone (no base_config on purpose): identical to voxcpm2.yaml with
+# dtype=float16 (the 310P line) and enable_incremental_vae=true so the AR
+# loop emits audio as patches complete — the only configuration that yields
+# a true first-packet latency and per-chunk ITL on the MRV1 runner.
+# vae_decode_every stays at the base 3; first-packet vs that VAE batch is
+# the metric under test (R7 in notes/310p-voxcpm2-risk-list.md).
+async_chunk: false
+dtype: float16
+
+stages:
+  - stage_id: 0
+    max_num_seqs: 8
+    gpu_memory_utilization: 0.9
+    kv_cache_memory_bytes: 6442450944  # 6 GiB
+    enforce_eager: true
+    trust_remote_code: true
+    enable_prefix_caching: false
+    async_scheduling: true
+    max_num_batched_tokens: 4096
+    max_model_len: 4096
+    devices: "0"
+    engine_extras:
+      hf_overrides:
+        voxcpm2_runtime_config:
+          inference_timesteps: 10
+          cfg_value: 2.0
+          cfg_cutoff_ratio: 1.0
+
+          audio_emit_every: 1
+          vae_decode_every: 3
+          enable_incremental_vae: true
+          enable_batched_cfm: true
+          enable_batched_vae_decode: true
+          coalesce_audio_d2h: true
+          enable_loc_dit_fused_qkv: true
+          enable_loc_dit_fused_mlp: true
+          enable_loc_dit_zero_dt_cache: true
+          enable_loc_dit_skip_qkv_contig: true
+          enable_loc_dit_reduce_overhead_no_cg: true
+          enable_unified_decode_graph: true
+          unified_decode_graph_max_batch_size: 8
+          enable_batched_fsq_fusion: true
+          enable_batched_prefill_tail: true
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 4096
+      seed: 42
+      repetition_penalty: 1.0
