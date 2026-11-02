@@ -373,6 +373,41 @@ def _patch_rng_fallback() -> None:
 
 
 # ---------------------------------------------------------------------------
+# 5. Startup dummy-run skip (main-process side; the warmup executes in the
+#    engine factory, not in the worker where the hook above lands)
+# ---------------------------------------------------------------------------
+
+
+def maybe_skip_startup_warmup_310p(od_config: Any) -> None:
+    """Self-gated: neutralize ``DiffusionEngine.run_startup_warmup`` on 310P.
+
+    Called from ``DiffusionEngine.make_engine`` right before the warmup call
+    (the main process).  The dummy forward hits a GE format-cast wall on this
+    stack (``can not cast format when output is input`` + ERR01007 at dummy
+    graph build, machine-verified on 126/C3 2026-11-02); the real request
+    drives its own eager compile.  Pattern: task-16
+    ``_patch_skip_startup_warmup`` (Qwen-Image-2.1, same box).  Re-enable once
+    the CANN-side gap is fixed.
+    """
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+    if getattr(DiffusionEngine, "_310p_warmup_skipped", False):
+        return
+    if not should_patch(od_config):
+        return
+
+    def _skip_startup_warmup(self):
+        logger.info(
+            "310P OmniVoice: startup dummy-run warmup skipped (GE format-cast "
+            "wall at dummy graph build); the first real request compiles "
+            "eagerly and pays the cold-compile cost."
+        )
+
+    DiffusionEngine.run_startup_warmup = _skip_startup_warmup
+    DiffusionEngine._310p_warmup_skipped = True  # type: ignore[attr-defined]
+
+
+# ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
 

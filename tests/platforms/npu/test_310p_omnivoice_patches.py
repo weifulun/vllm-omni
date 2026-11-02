@@ -137,6 +137,14 @@ def _install_omnivoice_fakes(monkeypatch: pytest.MonkeyPatch, is_310p_value: boo
     )
     _install_fake_module(monkeypatch, "vllm_omni.diffusion.attention.backends")
     _install_fake_module(monkeypatch, "vllm_omni.diffusion.attention")
+
+    class _FakeDiffusionEngine:
+        def run_startup_warmup(self):
+            raise AssertionError("warmup should have been skipped")
+
+    _install_fake_module(
+        monkeypatch, "vllm_omni.diffusion.diffusion_engine", DiffusionEngine=_FakeDiffusionEngine
+    )
     _install_fake_module(monkeypatch, "vllm_omni.diffusion")
     _install_fake_module(monkeypatch, "vllm_omni.model_executor.models")
     _install_fake_module(monkeypatch, "vllm_omni.model_executor")
@@ -336,6 +344,36 @@ def test_generator_compat_materializes_cpu_generator_on_npu_request():
     assert g.device.type == "cpu"
     assert torch.Generator().manual_seed(1).device.type == "cpu"
     assert torch.Generator(device="cpu").device.type == "cpu"
+
+
+# ---------------------------------------------------------------------------
+# Startup dummy-run skip (main-process side)
+# ---------------------------------------------------------------------------
+
+
+def test_warmup_skip_gated(monkeypatch):
+    patch, _, _ = _load_patch(monkeypatch, True)
+    engine = sys.modules["vllm_omni.diffusion.diffusion_engine"].DiffusionEngine
+    original = engine.run_startup_warmup
+    # Wrong model -> no-op.
+    patch.maybe_skip_startup_warmup_310p(_od_config("QwenImage21Pipeline"))
+    assert engine.run_startup_warmup is original
+    # Right model on 310P -> replaced; calling it must not run the dummy graph.
+    patch.maybe_skip_startup_warmup_310p(_od_config("OmniVoicePipeline"))
+    assert engine.run_startup_warmup is not original
+    inst = engine.__new__(engine)
+    engine.run_startup_warmup(inst)  # should not raise
+    assert getattr(engine, "_310p_warmup_skipped", False) is True
+    # Idempotent: second application is a silent no-op.
+    patch.maybe_skip_startup_warmup_310p(_od_config("OmniVoicePipeline"))
+
+
+def test_warmup_skip_noop_off_310p(monkeypatch):
+    patch, _, _ = _load_patch(monkeypatch, False)
+    engine = sys.modules["vllm_omni.diffusion.diffusion_engine"].DiffusionEngine
+    original = engine.run_startup_warmup
+    patch.maybe_skip_startup_warmup_310p(_od_config("OmniVoicePipeline"))
+    assert engine.run_startup_warmup is original
 
 
 # ---------------------------------------------------------------------------

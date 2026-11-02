@@ -1363,6 +1363,12 @@ class DiffusionEngine:
         """
         engine_class = DiffusionEngine.resolve_engine_class(config)
         engine = engine_class(config, scheduler=scheduler)
+        # Self-gated 310P hook (task-23): on 310P the OmniVoice dummy warmup
+        # hits a GE format-cast wall; the skip is a no-op off 310P or for any
+        # other model_class_name (see the patch module).
+        from vllm_omni.platforms.npu._310p.patch.omnivoice import maybe_skip_startup_warmup_310p
+
+        maybe_skip_startup_warmup_310p(config)
         engine.run_startup_warmup()
         return engine
 
