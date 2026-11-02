@@ -5,7 +5,10 @@
 
 from __future__ import annotations
 
+import logging
 import os
+
+logger = logging.getLogger(__name__)
 
 _WORKER_PATCHED = False
 _QWEN3_TTS_TALKER_ARCH = "Qwen3TTSTalkerForConditionalGeneration"
@@ -34,6 +37,32 @@ def apply_patches() -> None:
     _WORKER_PATCHED = True
 
 
+def _maybe_skip_startup_warmup() -> None:
+    """Skip the engine's 512x512 dummy warmup on 310P (research/012 class).
+
+    The generic ``DiffusionEngine._dummy_run`` warms up at a fixed 512x512
+    geometry.  On 310P (CANN 9.1.0), the conv sub-graphs that geometry
+    generates fail TBE dynamic-variant pre-compilation (MemSet via
+    ops_legacy/dynamic/mem_set.py) even though the real request geometry
+    compiles and runs.  ``VLLM_OMNI_310P_SKIP_WARMUP=1`` no-ops the dummy
+    run; kernels are then pre-compiled on the first real request.
+    """
+    if os.environ.get("VLLM_OMNI_310P_SKIP_WARMUP", "0") != "1":
+        return
+    from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
+
+    if getattr(DiffusionEngine, "_310p_warmup_skipped", False):
+        return
+
+    def _dummy_run_skipped(self):
+        logger.info(
+            "310P: skipping startup dummy warmup (VLLM_OMNI_310P_SKIP_WARMUP=1); first request pre-compiles kernels"
+        )
+
+    DiffusionEngine._dummy_run = _dummy_run_skipped
+    DiffusionEngine._310p_warmup_skipped = True  # type: ignore[attr-defined]
+
+
 def apply_diffusion_310p_patches(od_config) -> None:
     """Apply the 310P diffusion runtime patches for ``od_config``'s pipeline.
 
@@ -47,6 +76,8 @@ def apply_diffusion_310p_patches(od_config) -> None:
     """
     if os.environ.get("VLLM_OMNI_310P_DIFFUSION_PATCHES", "1") == "0":
         return
+
+    _maybe_skip_startup_warmup()
 
     model_arch = getattr(od_config, "model_class_name", None)
     module_names = _DIFFUSION_310P_PATCH_MODULES.get(model_arch)
