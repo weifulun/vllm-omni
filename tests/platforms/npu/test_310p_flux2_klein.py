@@ -116,10 +116,14 @@ def _make_fake_pipeline_module(monkeypatch: pytest.MonkeyPatch, vae: object) -> 
             self.vae = vae
             self.text_encoder = FakeEncoder()
 
+    def _fake_from_pf(cls_fn, *args, **kwargs):
+        return FakeEncoder()
+
     return _install_fake_module(
         monkeypatch,
         "vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein",
         Flux2KleinPipeline=FakeFlux2KleinPipeline,
+        from_pretrained_with_prefetch=_fake_from_pf,
     )
 
 
@@ -431,3 +435,62 @@ def test_registry_dispatches_by_model_class_name(monkeypatch: pytest.MonkeyPatch
     repeat = _make_od_config(model_class_name="Flux2KleinPipeline", dtype=torch.bfloat16)
     registry.apply_diffusion_310p_patches(repeat)
     assert repeat.dtype is torch.bfloat16
+
+class TestEncoderCpuGuard:
+    """Chain-1 (FLUX2KLEIN_310P_ENCODER_CPU=1): the Qwen3 text encoder never
+    touches the chip; the prompt-embeds forward is retargeted to the encoder
+    device and the tiny embeds tensor is moved back to the target."""
+
+    def test_cpu_pinned_encoder_absorbs_to_and_forwards(self, monkeypatch):
+        _install_patch_fakes(monkeypatch)
+        module = _load_flux2_klein_patch(monkeypatch)
+        proxy_cls = module._CpuPinnedEncoder
+
+        class FakeMod:
+            dtype = "fp16"
+
+            def forward(self, x):
+                return "enc(" + x + ")"
+
+            def __call__(self, x):
+                return "enc(" + x + ")"
+
+        m = FakeMod()
+        proxy = proxy_cls(m)
+        assert proxy.to("npu:0") is proxy
+        assert proxy.to("cpu", dtype="fp32") is proxy
+        assert proxy.dtype == "fp16"
+        assert proxy.forward("a") == "enc(a)"
+        assert proxy("b") == "enc(b)"
+
+    def test_retarget_decision_matrix(self, monkeypatch):
+        _install_patch_fakes(monkeypatch)
+        module = _load_flux2_klein_patch(monkeypatch)
+
+        cpu, npu = SimpleNamespace(type="cpu"), SimpleNamespace(type="npu")
+
+        # env off -> never retarget
+        monkeypatch.delenv(module._ENCODER_CPU_ENV, raising=False)
+        assert module._encoder_cpu_retarget(cpu, npu) is npu
+        assert module._encoder_cpu_retarget(None, npu) is npu
+
+        # env on + encoder on cpu + target npu -> run encoder on host
+        monkeypatch.setenv(module._ENCODER_CPU_ENV, "1")
+        assert module._encoder_cpu_retarget(cpu, npu) is cpu
+        # encoder on npu (not the chain-1 situation) -> keep target
+        assert module._encoder_cpu_retarget(npu, npu) is npu
+        # target already cpu -> keep
+        assert module._encoder_cpu_retarget(cpu, cpu) is cpu
+        # no encoder device info -> keep target
+        assert module._encoder_cpu_retarget(None, npu) is npu
+        monkeypatch.delenv(module._ENCODER_CPU_ENV)
+
+    def test_guard_install_is_env_gated(self, monkeypatch):
+        """apply() must not touch the pipeline module unless chain-1 is armed
+        (fakes-first discipline: no real vllm_omni import in CPU tests)."""
+        monkeypatch.delenv("FLUX2KLEIN_310P_ENCODER_CPU", raising=False)
+        _install_patch_fakes(monkeypatch)
+        module = _load_flux2_klein_patch(monkeypatch)
+        od_config = _make_od_config()
+        module.apply_diffusion_310p_patches(od_config)
+        assert module._ENCODER_CPU_GUARDED is False

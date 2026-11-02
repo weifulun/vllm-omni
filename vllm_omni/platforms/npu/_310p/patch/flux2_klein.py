@@ -89,6 +89,7 @@ _NUMERICAL_CACHE_BACKENDS = frozenset(
 _APPLIED = False
 _ATTENTION_GUARD_INSTALLED = False
 _VAE_TILING_WRAPPED = False
+_ENCODER_CPU_GUARDED = False
 
 #: Chain-1 OOM downgrade: pin the Qwen3 text encoder on host memory.
 _ENCODER_CPU_ENV = "FLUX2KLEIN_310P_ENCODER_CPU"
@@ -250,6 +251,111 @@ def _maybe_enable_vae_tiling(vae: Any) -> bool:
     return enabled
 
 
+class _CpuPinnedEncoder:
+    """Chain-1 proxy: the Qwen3 text encoder load stays on host memory and the
+    pipeline's ``.to(execution_device)`` cast is absorbed (no 8 GB NPU round
+    trip).  Attributes/calls forward to the wrapped module so the pipeline
+    code is untouched; per-request H2D of the small prompt tensors happens in
+    ``_get_qwen3_prompt_embeds`` (retargeted while env-gated)."""
+
+    def __init__(self, module: Any) -> None:
+        self._m = module
+
+    def to(self, *args: Any, **kwargs: Any) -> "_CpuPinnedEncoder":
+        return self
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._m, name)
+
+    def __call__(self, *args: Any, **kwargs: Any) -> Any:
+        return self._m(*args, **kwargs)
+
+
+def _encoder_cpu_retarget(encoder_device: Any, device: Any) -> Any:
+    """Chain-1 device decision for the Qwen3 prompt-embeds forward: while the
+    encoder lives on host (FLUX2KLEIN_310P_ENCODER_CPU=1), run the encoder
+    on its own device instead of the NPU; the tiny embeds tensor is moved to
+    the target afterwards (see _get_qwen3_prompt_embeds wrap)."""
+    if os.environ.get(_ENCODER_CPU_ENV, "0") != "1":
+        return device
+    enc_type = getattr(encoder_device, "type", None)
+    dev_type = getattr(device, "type", None)
+    if enc_type == "cpu" and dev_type is not None and dev_type != "cpu":
+        return encoder_device
+    return device
+
+
+def _install_encoder_cpu_guard() -> None:
+    """Chain-1 runtime guard (FLUX2KLEIN_310P_ENCODER_CPU=1):
+
+    1. the pipeline module's ``from_pretrained_with_prefetch`` returns a
+       ``_CpuPinnedEncoder`` proxy for the ``text_encoder`` subfolder, so the
+       Qwen3 8 GB load + ``.to(execution_device)`` never touches the chip;
+    2. ``Flux2KleinPipeline._get_qwen3_prompt_embeds`` runs the encoder on its
+       own device and moves the resulting embeds to the requested device.
+    """
+    global _ENCODER_CPU_GUARDED
+    if _ENCODER_CPU_GUARDED:
+        return
+    if os.environ.get(_ENCODER_CPU_ENV, "0") != "1":
+        return  # chain-1 not armed: no pipeline-module touch, no import side effects
+    _ENCODER_CPU_GUARDED = True
+
+    import sys as _sys
+
+    from vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein import (
+        Flux2KleinPipeline,
+    )
+
+    _pl = _sys.modules.get(
+        "vllm_omni.diffusion.models.flux2_klein.pipeline_flux2_klein"
+    )
+    if _pl is None:  # pragma: no cover - defensive; the import above populated it
+        raise RuntimeError("pipeline module missing from sys.modules after import")
+
+    _orig_from_pf = getattr(_pl, "from_pretrained_with_prefetch", None)
+    if _orig_from_pf is not None:
+
+        def _guarded_from_pf(cls_fn: Any, *args: Any, **kwargs: Any) -> Any:
+            module = _orig_from_pf(cls_fn, *args, **kwargs)
+            if os.environ.get(_ENCODER_CPU_ENV, "0") == "1" and kwargs.get("subfolder") == "text_encoder":
+                return _CpuPinnedEncoder(module)
+            return module
+
+        _pl.from_pretrained_with_prefetch = _guarded_from_pf
+
+    _orig_embeds = getattr(Flux2KleinPipeline, "_get_qwen3_prompt_embeds", None)
+
+    def _get_qwen3_prompt_embeds_310p(
+        self: Any,
+        text_encoder: Any,
+        tokenizer: Any,
+        prompt: Any,
+        hidden_states_layers: Any,
+        dtype: Any = None,
+        device: Any = None,
+        max_sequence_length: int = 512,
+    ) -> Any:
+        target = device
+        device = _encoder_cpu_retarget(getattr(text_encoder, "device", None), device)
+        out = _orig_embeds(
+            self,
+            text_encoder,
+            tokenizer,
+            prompt,
+            hidden_states_layers,
+            dtype,
+            device,
+            max_sequence_length,
+        )
+        if target is not None and out is not None and getattr(out, "device", None) != target:
+            out = out.to(target)
+        return out
+
+    if _orig_embeds is not None:
+        Flux2KleinPipeline._get_qwen3_prompt_embeds = _get_qwen3_prompt_embeds_310p
+
+
 def _install_vae_tiling_wrap() -> None:
     """Wrap ``Flux2KleinPipeline.__init__`` so the VAE switches on before
     the first request (the runner loads the pipeline right after the patch
@@ -270,8 +376,9 @@ def _install_vae_tiling_wrap() -> None:
             self._310p_encoder_cpu = True
             logger.warning(
                 "[310P][flux2-klein] text encoder pinned to CPU via %s "
-                "(chain-1 OOM downgrade, chip budget 21589 MB); per-request "
-                "H2D/D2H expected, encode stage timed separately.",
+                "(chain-1 OOM downgrade, chip budget 21589 MB); encoder never "
+                "touches the NPU (init cast absorbed), per-request H2D of the "
+                "small prompt embeds only.",
                 _ENCODER_CPU_ENV,
             )
 
@@ -354,5 +461,6 @@ def apply_diffusion_310p_patches(od_config: Any) -> None:
         )
     _check_heads_divisibility(od_config)
     _install_vae_tiling_wrap()
+    _install_encoder_cpu_guard()
     _install_attention_guard()
     _log_placement_plan(od_config)
