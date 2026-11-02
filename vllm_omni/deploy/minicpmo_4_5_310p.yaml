@@ -26,14 +26,16 @@ stages:
   - stage_id: 0
     tensor_parallel_size: 2
     devices: "0,1"
-    # boot15-16 (128 C1): 0.75 -> 0.70. chip1 device math: TP-rank pool
-    # 14.49 + stage2 pool 4.56 + CANN overhead ~1.1 = 20.2 of 20.51 GiB,
-    # leaving 312 MiB free vs the 376-438 MiB TTS flow-cache allocation
-    # (device-level OOM in _split_flow_cache, boot10-15). 0.70 drops the
-    # TP-rank pool ~1.0 GiB (15.38 -> 14.94 GiB ceiling). KV shrinks
-    # 0.99 -> ~0.6 GiB; the engine's max-model-length check fails loudly
-    # at boot if it is not enough.
-    gpu_memory_utilization: 0.72
+    # REAL-DEVICE RESULT (128 C1, 2026-11-03, boot16-18): stage-0 mmu is a
+    # NO-OP lever on this chip pair. The TP-rank retained caching pool is
+    # invariant to it (npu-smi proc-mem: 14521 MB at mmu 0.72 AND 0.75;
+    # also invariant to the dummy size: 14521 at 8192, 14841 at 2048) --
+    # the aee740b99 EH0012 no-op pins the retained blocks, and the
+    # free-based stage-2 pool re-expands whatever chip1 frees (4.56 -> 5.0
+    # GiB across boot14 -> boot18). mmu stays at the 0.75 that survived the
+    # KV saga (0.99 GiB KV, above the 0.57 GiB max-seq-len floor; 0.70/0.71
+    # both died on that floor check).
+    gpu_memory_utilization: 0.75
     max_model_len: 8192
     # Real-device (128 C1, 2026-11-03): shrink the profile dummy batch to cap the
     # retained caching-allocator blocks under the EH0012 no-op (aee740b99):
@@ -85,7 +87,7 @@ platforms:
         # max_num_batched_tokens note below); keep both layers in sync.
         # boot16 (128 C1): 0.75 -> 0.70, chip1 headroom for the stage-2 TTS
         # flow cache (flat-stage comment carries the full math).
-        gpu_memory_utilization: 0.72
+        gpu_memory_utilization: 0.75
         # Real-device (128 C1, 2026-11-03, boot10-12): the base 910B1 tuning
         # pins 8192 at THIS platform layer (applied after stage parsing, so it
         # wins over the flat stage key). The 8192-token profile dummy leaves a
@@ -99,23 +101,21 @@ platforms:
       - stage_id: 1
         kv_cache_memory_bytes: 1073741824
       - stage_id: 2
-        # Real-device (128 C1, 2026-11-03): stage 2 shares chip1 with the
-        # Thinker TP2 rank. Without an explicit cap the shared-chip free-based
-        # KV sizing consumed nearly all remaining free memory as KV, leaving
-        # no room for the runtime DiT flow cache (NPU OOM in
-        # _split_flow_cache: 438 MiB request vs 169 MiB free). Cap the KV at
-        # 1 GiB like stage 1; the code2wav KV is a small formality (the real
-        # streaming state lives in the flow/HiFT runtime caches).
+        # REAL-DEVICE FINDING (128 C1, 2026-11-03, boot10-18): stage 2's KV
+        # sizing BYPASSES every deploy-layer cap tried here. Both
+        # kv_cache_memory_bytes (kept as documented no-op for the stage-1
+        # twin) and a platform-layer gpu_memory_utilization: 0.15 (boot15)
+        # left the stage-2 pool unchanged (~5.0 GiB, free-based: it expands to
+        # consume whatever chip1 frees at init, boot14 4.56 -> boot18 5.0 as
+        # the TP pool shrank). The pool holds weights 3.23 GiB + KV +
+        # activations, and the per-request fp32 estimator attention cache
+        # (376-438 MiB, _split_flow_cache) then fails at device level:
+        # 14.2 TP-rank pool (invariant to mmu/dummy, EH0012 retained blocks)
+        # + 5.0 stage-2 pool + ~1.1 CANN overhead = ~20.3 of 20.51 GiB.
+        # TTS therefore needs either an upstream stage-2 sizing fix or the
+        # retained-pool release that EH0012 forbids. Cap kept for parity with
+        # stage 1.
         kv_cache_memory_bytes: 1073741824
-        # Real-device (128 C1, 2026-11-03, boot10-14): the base 910B1 overlay
-        # inherits gpu_memory_utilization: 0.22 at this platform layer, which
-        # sizes the stage-2 pool to ~4.5 GiB on chip1 (measured 4.53 GiB at
-        # OOM: 14.84 TP-rank pool + 4.53 stage-2 pool + ~0.4 flow cache >
-        # 20.51 GiB). Stage 2's real memory is weights (~0.7 GiB) + runtime
-        # flow/HiFT state; its KV is a small formality. 0.15 cuts the pool to
-        # ~3.1 GiB and leaves chip1 ~1.8 GiB of headroom for the per-request
-        # fp32 estimator attention cache.
-        gpu_memory_utilization: 0.15
         additional_config:
           code2wav_enable_npu_graph: false
           # NOTE: token2wav_float16 must live in the connectors section extra,
