@@ -19,9 +19,12 @@ tag 5917730 pipeline/transformer sources):
   "VAE tiling" invariants therefore have no surface here (documented N/A).
 - The HF checkpoint stores F32 weights (8 shards, 35.2 GB on disk).  The
   transformer's ``load_weights`` skips ``model.visual.*`` (vision tower,
-  unused for T2I) and ``lm_head.weight``, so the resident FP16 footprint on
-  one 21589 MB 310P3 chip is ~15.4 GB (decimal) - inside the single-chip
-  budget (research/014 survey line: 8.8 B / 17.6 GB FP16 edge).
+  unused for T2I) and ``lm_head.weight`` (14.17 GiB loaded FP16 weights).
+  MEASURED on 126 C1 (serial 2106030655ZEP5000578, 21.08 GiB chip): the FP16
+  tier OOMs - 14.17 GiB weights + ~3.4 GiB attention/softmax peak (2.03 GiB
+  S x S fp32 softmax request at 2048x2048), two independent reproductions at
+  the same allocation point.  The GO ladder therefore lands on the POLICY
+  section-2 second tier: INT8 W8A8 (online dynamic, research/009).
 - The pipeline hard-asserts BF16 (``_validate_static_config`` raises unless
   ``od_config.dtype == bfloat16``), and the engine itself sets
   ``od_config.dtype=bfloat16`` by default.  310P is FP16-only (POLICY section
@@ -353,10 +356,10 @@ def _validate_quantization(od_config: Any) -> None:
     weights do not fit the chip budget (no BF16, no over-budget forcing).
     research/009: on 310P only INT8 W8A8 has a hardware benefit; FP8/MXFP*
     fall back to FP16 matmul with no gain, ConvRot is unvalidated,
-    bitsandbytes is CUDA-only.  HiDream-O1-Image fits ONE 21589 MB chip at
-    FP16 (~15.4 GB decimal resident after the loader skips model.visual.*
-    and lm_head.weight), so the FP16 tier is the GO tier and INT8 stays an
-    admission-path fallback, not the primary.
+    bitsandbytes is CUDA-only.  MEASURED: the FP16 tier OOMs on the 21.08 GiB
+    single chip (14.17 GiB FP16 weights + ~3.4 GiB attention peak > capacity),
+    so on HiDream-O1-Image INT8 W8A8 is the ACTIVE tier on this card - the
+    gate admits it with a warning instead of expecting it to stay unused.
     """
     quant_config = getattr(od_config, "quantization_config", None)
     if quant_config is None:
@@ -367,12 +370,12 @@ def _validate_quantization(od_config: Any) -> None:
             "[310P][hidream-o1] quantization_config method=%r accepted as the "
             "POLICY section-2 second tier (research/009): online dynamic INT8 "
             "via npu_quant_matmul, layers with output dim > 65535 fall back "
-            "to unquantized (mixed-precision semantics; 310P has no diffusion "
-            "INT8 e2e precedent - the per-layer fallback log and precision "
-            "evidence vs the FP16 reference are MANDATORY in the real-device "
-            "report). On HiDream-O1-Image (8.8 B, ~15.4 GB decimal FP16 "
-            "resident) the FP16 tier fits the single-chip budget, so INT8 is "
-            "expected to stay unused.",
+            "to unquantized (mixed-precision semantics). MEASURED: the FP16 "
+            "tier OOMs on the 21.08 GiB chip (14.17 GiB weights + ~3.4 GiB "
+            "attention peak), so INT8 is the ACTIVE tier on HiDream-O1-Image "
+            "on this card. 310P has no diffusion INT8 e2e precedent - the "
+            "per-layer fallback log and precision evidence vs the FP16 "
+            "reference are MANDATORY in the real-device report.",
             method,
         )
         return
