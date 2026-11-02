@@ -92,6 +92,7 @@ _ATTENTION_GUARD_INSTALLED = False
 _VAE_TILING_WRAPPED = False
 _ENCODER_CPU_GUARDED = False
 _DIT_FP16_GUARDED = False
+_LOADER_FP16_GUARDED = False
 
 #: Chain-1 OOM downgrade: pin the Qwen3 text encoder on host memory.
 _ENCODER_CPU_ENV = "FLUX2KLEIN_310P_ENCODER_CPU"
@@ -559,6 +560,45 @@ def _install_dit_fp16_guard() -> None:
     Flux2Transformer2DModel.forward = _forward_310p_fp16
 
 
+def _install_loader_fp16_guard() -> None:
+    """Catch-all BF16->FP16 cast at the one weight-loading choke point.
+
+    Every diffusion component (text encoder, DiT, VAE) lands through
+    DiffusersPipelineLoader.load_weights; the loader does not cast the
+    on-disk dtype to the od_config dtype, and the loader telemetry then
+    PRINTS a bf16 Parameter (repr -> torch.cat on the NPU -> EZ1001),
+    killing the run before the first forward.  Wrap the choke point and
+    cast each component to FP16 the moment its weights land.
+    """
+    global _LOADER_FP16_GUARDED
+    if _LOADER_FP16_GUARDED:
+        return
+    _LOADER_FP16_GUARDED = True
+
+    from vllm_omni.diffusion.model_loader.diffusers_loader import (
+        DiffusersPipelineLoader,
+    )
+
+    _orig_load_weights = DiffusersPipelineLoader.load_weights
+
+    def _load_weights_310p_fp16(self: Any, model: Any, **kwargs: Any) -> None:
+        _orig_load_weights(self, model, **kwargs)
+        p = next(iter(model.parameters()), None)
+        if p is not None and p.dtype is not torch.float16:
+            logger.warning(
+                "[310P][flux2-klein] %s weights loaded as %s; casting to "
+                "float16 in place (310P is FP16-only hardware)",
+                type(model).__name__,
+                p.dtype,
+            )
+            model.to(dtype=torch.float16)
+            _evidence("loader-cast", f"{type(model).__name__} {p.dtype} -> fp16")
+        else:
+            _evidence("loader-ok", f"{type(model).__name__} already-fp16")
+
+    DiffusersPipelineLoader.load_weights = _load_weights_310p_fp16
+
+
 def apply_diffusion_310p_patches(od_config: Any) -> None:
     """Apply all FLUX.2-klein 310P invariants. Idempotent per process.
 
@@ -586,5 +626,6 @@ def apply_diffusion_310p_patches(od_config: Any) -> None:
     _install_vae_tiling_wrap()
     _install_encoder_cpu_guard()
     _install_dit_fp16_guard()
+    _install_loader_fp16_guard()
     _install_attention_guard()
     _log_placement_plan(od_config)

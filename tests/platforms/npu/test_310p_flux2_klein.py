@@ -199,6 +199,17 @@ def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         Flux2Transformer2DModel=FakeDiTModel,
     )
 
+    # Loader choke-point guard (BF16 on-disk -> fp16 cast per component).
+    class FakePipelineLoader:
+        def load_weights(self, model, **kwargs):
+            return None
+
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.diffusion.model_loader.diffusers_loader",
+        DiffusersPipelineLoader=FakePipelineLoader,
+    )
+
     captured["platform_module"] = fake_platform_module
     captured["backend_calls"] = calls
     return captured
