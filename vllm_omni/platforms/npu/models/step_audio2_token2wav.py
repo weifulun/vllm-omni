@@ -46,6 +46,33 @@ def _linear_downsample_even_scale(x: torch.Tensor, scale: int) -> torch.Tensor:
     return (x[..., left::scale] + x[..., right::scale]) * 0.5
 
 
+def _linear_upsample_exact(x: torch.Tensor, scale: int) -> torch.Tensor:
+    """``F.interpolate(mode="linear", align_corners=False, scale_factor=scale)``
+    for a positive integer ``scale``, without the ``linear1d`` kernel.
+
+    Ascend 310P has no dynamic-shape JSON config for
+    ``aclnnUpsampleLinear1d`` (Config_Error EZ1013, ``ParseDynamicKernels``
+    fails for ResizeD), so any 1-D linear ``F.interpolate`` on NPU aborts.
+    The index form below is numerically the same operation: every output
+    location maps to input coordinate ``(j + 0.5) / scale - 0.5`` and blends
+    its two neighboring samples with the matching weight. All primitives
+    (arange / clamp / floor / gather / mul / add) are NPU-safe.
+    """
+    if scale <= 0:
+        raise ValueError(f"scale must be a positive integer, got {scale}")
+    if scale == 1:
+        return x
+    t_in = x.shape[-1]
+    idx = (torch.arange(t_in * scale, device=x.device, dtype=x.dtype) + 0.5) / scale - 0.5
+    idx = idx.clamp(min=0.0, max=float(t_in - 1))
+    i0 = idx.floor().to(torch.long)
+    i1 = (i0 + 1).clamp(max=t_in - 1)
+    i0e = i0.view(1, 1, -1).expand(x.shape[0], x.shape[1], -1)
+    i1e = i1.view(1, 1, -1).expand(x.shape[0], x.shape[1], -1)
+    w = (idx - i0.to(x.dtype)).view(1, 1, -1)
+    return x.gather(-1, i0e) * (1.0 - w) + x.gather(-1, i1e) * w
+
+
 def _run_original_f02sine_on_cpu(self, f0_values: torch.Tensor) -> torch.Tensor:
     """Run the unmodified ``_f02sine`` without invoking NPU ``linear1d``."""
     output_device = f0_values.device
@@ -74,11 +101,11 @@ def _f02sine_with_npu_safe_downsample(self, f0_values: torch.Tensor) -> torch.Te
 
     rad_values = _linear_downsample_even_scale(rad_values.transpose(1, 2), scale).transpose(1, 2)
     phase = torch.cumsum(rad_values, dim=1) * 2 * np.pi
-    phase = F.interpolate(
-        phase.transpose(1, 2) * self.upsample_scale,
-        scale_factor=self.upsample_scale,
-        mode="linear",
-    ).transpose(1, 2)
+    # 310P: the 1-D linear upsample below would run the broken
+    # ``aclnnUpsampleLinear1d`` dynamic-shape kernel (EZ1013); use the exact
+    # index form instead (same values, NPU-safe primitives only).
+    scale = int(upsample_scale)
+    phase = _linear_upsample_exact(phase.transpose(1, 2) * scale, scale).transpose(1, 2)
     return torch.sin(phase)
 
 
