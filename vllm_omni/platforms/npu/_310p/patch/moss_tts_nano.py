@@ -66,8 +66,8 @@ _ORIGINAL_MULTINOMIAL = None
 _DETERMINISTIC_SAMPLING = os.environ.get("MOSS_DETERMINISTIC_SAMPLING") == "1"
 
 
-def _cast_module_to_310p_dtype(module) -> None:
-    """Force a not-vLLM-managed module (remote LM / audio tokenizer) to fp16.
+def _cast_module_to_dtype(module, dtype: torch.dtype) -> None:
+    """Force a not-vLLM-managed module (remote LM / audio tokenizer) to a dtype.
 
     910/CUDA run these sub-models in bf16/fp32; 310P is FP16-first, so both
     sub-models are recast wholesale (params + floating-point buffers, which
@@ -81,7 +81,12 @@ def _cast_module_to_310p_dtype(module) -> None:
     if module is None:
         return
     with torch.no_grad():
-        module.to(dtype=_RUNTIME_DTYPE)
+        module.to(dtype=dtype)
+
+
+def _cast_module_to_310p_dtype(module) -> None:
+    """fp16 variant (310P runtime dtype) of :func:`_cast_module_to_dtype`."""
+    _cast_module_to_dtype(module, _RUNTIME_DTYPE)
 
 
 def _multinomial_310p_path(input: torch.Tensor, num_samples: int, replacement: bool, out) -> bool:
@@ -189,6 +194,13 @@ class _MossTTSNano310P(modeling_moss_tts_nano.MossTTSNanoForGeneration):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         _cast_module_to_310p_dtype(self._lm)
         _cast_module_to_310p_dtype(self._audio_tokenizer)
+        # Upstream runs quantization AND decode on fp32 tensors by design
+        # (``encoder_hidden_states.float()`` / ``decode_codes(codes).float()``
+        # at both boundaries); aclnn has no implicit cast, so those
+        # sub-modules must keep fp32 params. The encoder itself stays fp16
+        # (its fp16 output is cast to fp32 at the boundary).
+        for _sub in ("quantizer", "decoder"):
+            _cast_module_to_dtype(getattr(self._audio_tokenizer, _sub, None), torch.float32)
         _wrap_audio_tokenizer_encode(self._audio_tokenizer)
 
 
