@@ -41,7 +41,6 @@ def apply_model_patches(model_config) -> None:
         from vllm_omni.platforms.npu._310p.patch.qwen3_tts import apply_code2wav_patches
 
         apply_code2wav_patches()
-        return
     elif model_arch in _MOSS_TTS_TALKER_ARCHS:
         from vllm_omni.platforms.npu._310p.patch.moss_tts import apply_talker_patches
 
