@@ -1,0 +1,36 @@
+# IndexTTS 2.5 310P (Atlas 300I Duo / Ascend 310P) deployment overlay.
+#
+# 310P is the FP16 line:
+#   * dtype float16 — the AR talker (GPT-2, stage 0) loads FP16 weights and the
+#     S2Mel model (stage 1) is built under the FP16 default dtype. BF16 is not
+#     available on 310P and is not assumed anywhere.
+#   * Stage 1 hf_overrides — the base config pins s2mel_dit_bf16: true for the
+#     910B/GPU line (bf16 estimator pre-cast + bf16 autocast). On 310P the CFM
+#     estimator stays FP32 (correctness path; the solver is FP32 regardless),
+#     BigVGAN runs FP32 eager (the vocoder bf16 switch is CUDA-gated in model
+#     code), and the DiT/vocoder torch.compile + CUDA-graph runtimes are forced
+#     off (they are CUDA-gated in model code anyway — the overlay makes the
+#     intent explicit). The 310P model patch
+#     (vllm_omni/platforms/npu/_310p/patch/indextts2.py) enforces the same
+#     switches at the model level as belt-and-braces.
+#
+# Everything else (two-stage topology, sampling constraints, attention
+# backend) is inherited from indextts2_5.yaml. On NPU the vllm-ascend platform
+# resolves the attention backend from the hardware profile and ignores the
+# inherited TRITON_ATTN selection (a CUDA parity knob for the GPT-2 talker).
+#
+# Usage on the 310P card (single chip via ASCEND_RT_VISIBLE_DEVICES):
+#   vllm serve <local IndexTTS-2.5 bundle> \
+#     --omni --trust-remote-code --port 8092 \
+#     --deploy-config vllm_omni/deploy/indextts2_5_310p.yaml
+base_config: indextts2_5.yaml
+dtype: float16
+stages:
+  - stage_id: 1
+    hf_overrides:
+      s2mel_dit_bf16: false
+      s2mel_vocoder_bf16: false
+      s2mel_dit_torch_compile: false
+      s2mel_dit_cuda_graph: false
+      s2mel_vocoder_torch_compile: false
+      s2mel_vocoder_cuda_graph: false
