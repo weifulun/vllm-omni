@@ -29,9 +29,13 @@ stages:
     # torch.npu.mem_get_info on node 128).  The base config's 0.45 H200
     # sizing leaves 8.7 GiB of headroom above the 8.72 GiB thinker weights
     # alone -> negative KV budget.  Raise utilization and shrink the
-    # encoder-cache budget (== max_num_batched_tokens): the thinker is a
-    # prefill-only encoder with max ~1.5K-token prompts in the AuK contract.
+    # encoder-cache budget (== max_num_batched_tokens) and the sequence
+    # cap: the thinker is a prefill-only encoder with max ~1.5K-token
+    # prompts in the AuK contract (<=30 s audio ~= <=500 audio tokens +
+    # text).  max_model_len must stay >= max_num_batched_tokens
+    # (vLLM SchedulerConfig validation, chunked prefill off).
     gpu_memory_utilization: 0.92
     max_num_batched_tokens: 4096
+    max_model_len: 4096
   - stage_id: 1
     enforce_eager: true
