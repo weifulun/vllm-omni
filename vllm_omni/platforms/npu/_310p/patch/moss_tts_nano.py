@@ -147,6 +147,9 @@ def _wrap_audio_tokenizer_encode(at: torch.nn.Module) -> None:
     the whole encoder. Semantics-preserving: fp32 -> fp16 on the encode path
     only (identical to what the fp16 weights already imply numerically).
     """
+    if not hasattr(at, "batch_encode"):
+        # Test fakes / tokenizers without an encode path: nothing to cast.
+        return
     orig = at.batch_encode
 
     def _param_dtype() -> torch.dtype | None:
