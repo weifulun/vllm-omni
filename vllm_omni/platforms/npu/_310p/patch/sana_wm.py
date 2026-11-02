@@ -271,6 +271,14 @@ class _SanaWm310P(SanaWmPipeline):
         if not path:
             return
 
+        try:
+            import os as _os
+
+            with open(path, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps({"phase": "_hook_installed", "s": 0, "pid": _os.getpid()}) + "\n")
+        except OSError:
+            pass
+
         def _sync() -> None:
             npu = getattr(torch, "npu", None)
             if npu is not None:
