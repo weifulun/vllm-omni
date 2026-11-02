@@ -22,6 +22,7 @@ _QWEN3_TTS_CODE2WAV_ARCH = "Qwen3TTSCode2Wav"
 # apply_diffusion_310p_patches() unchanged.
 _DIFFUSION_310P_PATCH_MODULES: dict[str, list[str]] = {
     "StableDiffusionXLPipeline": ["vllm_omni.platforms.npu._310p.patch.sdxl"],
+    "SanaWmPipeline": ["vllm_omni.platforms.npu._310p.patch.sana_wm"],
 }
 
 
