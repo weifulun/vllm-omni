@@ -23,6 +23,7 @@ _QWEN3_TTS_CODE2WAV_ARCH = "Qwen3TTSCode2Wav"
 _DIFFUSION_310P_PATCH_MODULES: dict[str, list[str]] = {
     "StableDiffusionXLPipeline": ["vllm_omni.platforms.npu._310p.patch.sdxl"],
     "ZImagePipeline": ["vllm_omni.platforms.npu._310p.patch.z_image"],
+    "ABotWorldCausalPipeline": ["vllm_omni.platforms.npu._310p.patch.abot_world"],
 }
 
 
@@ -84,8 +85,10 @@ def apply_diffusion_310p_patches(od_config) -> None:
     ``VLLM_OMNI_310P_SKIP_WARMUP``).
     """
     from vllm_omni.platforms.npu._310p.patch.attention import maybe_patch_sdpa_math
+    from vllm_omni.platforms.npu._310p.patch.ar_paged import maybe_patch_ar_paged_math
 
     maybe_patch_sdpa_math()
+    maybe_patch_ar_paged_math()
     _pin_hf_encoder_dtype()
     _offload_hf_text_encoder()
     # Hardware-level too: the engine's 512x512 dummy warmup generates conv
