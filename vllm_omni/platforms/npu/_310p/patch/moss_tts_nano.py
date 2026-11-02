@@ -119,6 +119,41 @@ def _install_multinomial_guard() -> None:
     _MULTINOMIAL_GUARD_INSTALLED = True
 
 
+def _wrap_audio_tokenizer_encode(at: torch.nn.Module) -> None:
+    """310P: the remote ``_call_audio_encode`` force-casts the prompt waveform
+    to fp32 (``torch.as_tensor(waveform, dtype=torch.float32)``), while the
+    recast tokenizer parameters are fp16 — aclnn is strict about
+    weightOptional/input dtype (EZ1001) and has no implicit cast.
+
+    Cast the encode input to the tokenizer's parameter dtype at the
+    ``batch_encode`` boundary. ``_prepare_waveform_batch`` derives the padded
+    buffer dtype from ``wav_list[0].dtype``, so the cast propagates through
+    the whole encoder. Semantics-preserving: fp32 -> fp16 on the encode path
+    only (identical to what the fp16 weights already imply numerically).
+    """
+    orig = at.batch_encode
+
+    def _param_dtype() -> torch.dtype | None:
+        for p in at.parameters():
+            if p.is_floating_point():
+                return p.dtype
+        return None
+
+    def batch_encode_310p(wav_list, *args, **kwargs):
+        dt = _param_dtype()
+        if dt is not None:
+            casted = []
+            for w in wav_list:
+                w = torch.as_tensor(w)
+                if w.is_floating_point() and w.dtype != dt:
+                    w = w.to(dt)
+                casted.append(w)
+            wav_list = casted
+        return orig(wav_list, *args, **kwargs)
+
+    at.batch_encode = batch_encode_310p
+
+
 class _MossTTSNano310P(modeling_moss_tts_nano.MossTTSNanoForGeneration):
     """Nano on 310P: FP16-forced remote LM + audio tokenizer.
 
@@ -135,6 +170,7 @@ class _MossTTSNano310P(modeling_moss_tts_nano.MossTTSNanoForGeneration):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         _cast_module_to_310p_dtype(self._lm)
         _cast_module_to_310p_dtype(self._audio_tokenizer)
+        _wrap_audio_tokenizer_encode(self._audio_tokenizer)
 
 
 def apply_nano_patches() -> None:
