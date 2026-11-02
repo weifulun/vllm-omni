@@ -1,0 +1,29 @@
+# AuK 310P (Atlas 300I Duo / Ascend 310P) deployment overlay.
+#
+# The 310P line is an FP16 line (no BF16 on the chip): the assembled
+# checkpoint ships fp32 (DiT) / mixed (Qwen2.5-Omni-3B thinker), so the
+# pipeline-wide ``dtype: float16`` loads the thinker in FP16 and the
+# diffusion patch (vllm_omni/platforms/npu/_310p/patch/auk.py) forces the
+# DiT to FP16 before construction.  The BigVGAN-flow VAE stays FP32 on the
+# inference device regardless (numerically sensitive codec).
+#
+# Both stages run fully eager on 310P:
+#   stage 0 (frozen thinker encoder, prefill only): the base config's FULL
+#     CUDA-graph capture mode is a 910/H-series optimization; 310P runs the
+#     prefill eager (the encoder is ~3% of a request, so the wall cost is
+#     negligible) and avoids ACL graph-capture issues on the 310P3 SoC;
+#   stage 1 (rectified-flow DiT + BigVGAN-flow VAE): torch.compile and the
+#     CUDA-graph buckets are CUDA-only on NPU (the diffusion runner already
+#     skips compilation when the platform lacks an inductor, and the graph
+#     wrappers self-guard on non-CUDA tensors); enforce_eager makes the
+#     intent explicit and skips the startup warm-up buckets.
+#
+# Usage on the 310P card (single chip, TP1):
+#   vllm serve <auk-omni dir> --deploy-config vllm_omni/deploy/auk_310p.yaml
+base_config: auk.yaml
+dtype: float16
+stages:
+  - stage_id: 0
+    enforce_eager: true
+  - stage_id: 1
+    enforce_eager: true
