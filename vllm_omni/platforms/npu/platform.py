@@ -14,6 +14,7 @@ from vllm_ascend.platform import NPUPlatform
 
 from vllm_omni.diffusion.attention.backends.registry import DiffusionAttentionBackendEnum
 from vllm_omni.platforms.interface import OmniPlatform, OmniPlatformEnum
+from vllm_omni.platforms.npu._310p import is_310p
 
 logger = init_logger(__name__)
 
@@ -266,6 +267,19 @@ class NPUOmniPlatform(OmniPlatform, NPUPlatform):
         apply_minimax_h3_qwen3vl_swiglu_patch()
         set_mc2_tokens_capacity(vllm_config, od_config.max_num_seqs, 1)
         set_mc2_mask(vllm_config, device)
+
+        # 310P diffusion runtime: no MindIE-SD, plain torch_npu + FP16.
+        # Registry-style dispatch (COMPARISON-POLICY.md §5): this call site is
+        # owned by the SDXL branch (task-11); model branches register patch
+        # modules in _310p.patch and must not edit platform.py.  JIT compile
+        # is disabled here because diffusion workers do not inherit the AR
+        # worker patch.
+        if is_310p():
+            from vllm_omni.platforms.npu._310p import disable_jit_compile
+            from vllm_omni.platforms.npu._310p.patch import apply_diffusion_310p_patches
+
+            disable_jit_compile()
+            apply_diffusion_310p_patches(od_config)
 
     @classmethod
     def get_default_stage_config_path(cls) -> str:
