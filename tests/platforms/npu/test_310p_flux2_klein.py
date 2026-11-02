@@ -204,12 +204,16 @@ def test_fp16_is_accepted_and_config_normalized(monkeypatch: pytest.MonkeyPatch)
     assert od_config.cache_backend is None
 
 
-def test_bf16_dtype_is_rejected_on_310p(monkeypatch: pytest.MonkeyPatch):
+def test_bf16_dtype_is_forced_to_fp16_on_310p(monkeypatch: pytest.MonkeyPatch):
+    """310P invariant: a non-FP16 incoming dtype is corrected in place (the
+    platform layer enforces the FP16-only hardware invariant; SDXL-line
+    precedent).  bf16 could never sail silently onto unqualified ops."""
     _install_patch_fakes(monkeypatch)
     module = _load_flux2_klein_patch(monkeypatch)
 
-    with pytest.raises(RuntimeError, match="FP16"):
-        module.apply_diffusion_310p_patches(_make_od_config(dtype=torch.bfloat16))
+    od_config = _make_od_config(dtype=torch.bfloat16)
+    module.apply_diffusion_310p_patches(od_config)
+    assert od_config.dtype is torch.float16
 
 
 def test_explicit_mindiesd_backend_is_rejected(monkeypatch: pytest.MonkeyPatch):

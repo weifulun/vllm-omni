@@ -12,8 +12,9 @@ pipeline is constructed.
 310P diffusion decision: pure ``torch_npu`` + FP16, no MindIE-SD kernels.
 Invariants enforced here:
 
-* ``od_config.dtype`` must be ``float16``.  310P is FP16-only (no BF16); a
-  non-FP16 config would sail silently onto unqualified operators.
+* ``od_config.dtype`` is forced to ``float16``.  310P is FP16-only (no BF16
+  kernel path); a non-FP16 incoming dtype is corrected in place at the
+  platform layer (SDXL-line precedent: patch-forced dtype).
 * The diffusion attention backend resolves to ``TORCH_SDPA`` whenever the
   user did not select one: MindIE-SD's ``FLASH_ATTN`` / ``RAINFUSION_ATTN``
   kernels do not exist on 310P, and the platform's ``find_spec("mindiesd")``
@@ -96,13 +97,21 @@ _ENCODER_CPU_ENV = "FLUX2KLEIN_310P_ENCODER_CPU"
 
 
 def _force_fp16(od_config: Any) -> None:
+    """Force FP16 (310P invariant; SDXL-line precedent: patch-forced dtype).
+
+    310P is FP16-only hardware — there is no bf16 decision this line could
+    make, so a non-FP16 incoming dtype is corrected in place (and logged)
+    rather than rejected: the platform layer is the enforcement point for
+    the hardware invariant, and the config plumbing above it evolves across
+    vllm-omni lines."""
     dtype = getattr(od_config, "dtype", None)
     if dtype == torch.float16:
         return
-    raise RuntimeError(
-        f"310P diffusion requires FP16 (od_config.dtype={dtype!r}); "
-        "310P is FP16-only and the FLUX.2-klein line has no bf16 decision. "
-        "Pass float16 as the diffusion dtype."
+    od_config.dtype = torch.float16
+    logger.warning(
+        "[310P][flux2-klein] forced od_config.dtype=%r -> float16 "
+        "(310P is FP16-only hardware; no bf16 kernel path exists)",
+        dtype,
     )
 
 
