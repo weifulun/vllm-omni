@@ -632,6 +632,11 @@ def _resampler_push_310p(self: _dav_module.StreamingResampler, chunks, *, flush:
     """
     import torchaudio.functional as audio_functional
 
+    # The upstream __init__ creates the context tensor on the input device;
+    # this twin keeps every staged piece on the host, so normalize once.
+    if self._context is not None:
+        self._context = self._context.to("cpu")
+
     parts = [chunk for chunk in chunks if chunk.numel()]
     if self._pending is not None:
         parts.insert(0, self._pending)
