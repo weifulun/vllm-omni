@@ -113,9 +113,22 @@ class FakeVoxCPM2TalkerBase(nn.Module):
         self._tts = _make_fake_tts()
         self._side_dtype = torch.bfloat16  # native checkpoint dtype
         self._setup_calls = 0
+        self._vae_decode_dtypes: list[torch.dtype] = []
+
+    @property
+    def tts(self) -> nn.Module:
+        # Mirrors the v0.32.0 talker (``tts`` is a property over ``_tts``).
+        return self._tts
 
     def _setup_execution_optimizations(self) -> None:
         self._setup_calls += 1
+
+    def _run_vae_decode(self, feat: torch.Tensor) -> torch.Tensor:
+        # Records the dtype the latent arrives in; the 310P subclass must
+        # re-cast FP32 latents to the VAE parameter dtype before this sees
+        # them (FP16 convs reject mixed input/bias dtypes on 310P).
+        self._vae_decode_dtypes.append(feat.dtype)
+        return feat
 
     def load_weights(self, weights):
         del weights
@@ -376,3 +389,27 @@ def test_encode_raw_audio_resamples_on_cpu(monkeypatch: pytest.MonkeyPatch) -> N
     feat = module._encode_raw_audio_310p(tts2, [0.0] * 1600, 16000, keep_on_device=True)
     assert _RecordingResample.calls == [torch.device("cpu")]
     assert feat.dim() == 3
+
+
+def test_talker310p_casts_vae_decode_latent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """FP32 AR latents must reach the FP16 AudioVAE as FP16.
+
+    Real-device first run (126, C2) died in ``F.conv1d`` with
+    ``Input type (float) and bias type (c10::Half) should be the same``:
+    the VAE decode convs were FP16 (cast by this patch) while the talker's
+    AR-side latent projection stays FP32.  The 310P talker must cast at the
+    ``_run_vae_decode`` boundary.
+    """
+    module, fakes = _load_voxcpm2_patch(monkeypatch)
+    module.apply_voxcpm2_310p_patches()
+    swapped = fakes.vox.VoxCPM2TalkerForConditionalGeneration
+    model = swapped(vllm_config=_fake_vllm_config(torch.float16))
+
+    # The VAE runs FP16 after the patch, so the decode boundary must see
+    # FP16 regardless of the incoming latent dtype.
+    assert next(model._tts.audio_vae.parameters()).dtype is torch.float16
+
+    model._run_vae_decode(torch.randn(1, 4, 8))  # FP32 latent (AR projection)
+    model._run_vae_decode(torch.randn(1, 4, 8, dtype=torch.float16))  # already FP16
+
+    assert model._vae_decode_dtypes == [torch.float16, torch.float16]

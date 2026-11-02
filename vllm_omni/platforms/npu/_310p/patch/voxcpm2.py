@@ -26,6 +26,14 @@ equivalents:
   AudioVAE, which also decodes on the NPU — it cannot be pinned to CPU.  The
   only device-sensitive preprocessing step is ``torchaudio.Resample`` inside
   ``_encode_raw_audio``; on 310P it is forced onto the CPU before the H2D copy.
+* **VAE decode latent cast.**  The talker computes the AR-side latent in FP32
+  (numerically-stable projection), then hands it to ``audio_vae.decode``.  The
+  910 line never sees the mismatch because tts modules run uniformly in BF16;
+  once this patch casts the AudioVAE to FP16, the FP32 latent hits FP16 conv
+  biases (``Input type (float) and bias type (c10::Half) should be the
+  same``).  The 310P talker subclass therefore re-casts the latent to the
+  VAE parameter dtype at the ``_run_vae_decode`` boundary before calling
+  super.
 
 Device-verification TODOs (kept OFF by default, see the ``_LOC_DIT_*`` flags):
 the Qwen3-TTS template's 310P flash-attention recipe
@@ -298,6 +306,22 @@ def apply_voxcpm2_310p_patches() -> None:
                 conv_count,
             )
             _wrap_lazy_optimization_setup(self)
+
+        def _run_vae_decode(self, feat: torch.Tensor) -> torch.Tensor:
+            """Cast the latent to the AudioVAE parameter dtype before decode.
+
+            After ``_force_310p_fp16`` the VAE convolutions are FP16, but the
+            latent produced by the AR-side projection is FP32; the 910 line
+            never meets this (uniform BF16).  Without the cast the first
+            decode step dies in ``F.conv1d`` with an input/bias dtype
+            mismatch.  The eager and CUDA/NPU graph branches both go through
+            this boundary, so casting here covers both.
+            """
+            vae = self.tts.audio_vae
+            ref = next(vae.parameters(), None)
+            if ref is not None and feat.dtype != ref.dtype:
+                feat = feat.to(ref.dtype)
+            return super()._run_vae_decode(feat)
 
     vox_module.VoxCPM2TalkerForConditionalGeneration = _VoxCPM2Talker310P  # type: ignore[assignment]
 
