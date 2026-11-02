@@ -227,6 +227,13 @@ def _offload_talker_embeddings_310p(worker) -> None:
             continue
         module.to("cpu")
         moved.append(f"{name} {tuple(param.shape)} fp16")
+    # The c0 logit-index buffer is consumed inside sample() against the
+    # (now host-side) logits; the other index buffers stay NPU-side with the
+    # forward path.
+    c0_ids = getattr(model, "c0_logit_ids", None)
+    if c0_ids is not None and c0_ids.device.type != "cpu":
+        model.c0_logit_ids = c0_ids.cpu()
+        moved.append("c0_logit_ids int64")
     if moved:
         logger.info(
             "MiniMax Music 3 310P: talker embeddings offloaded to host: %s",
