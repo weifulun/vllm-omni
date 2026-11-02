@@ -1,0 +1,86 @@
+# MiniMax H3 on Ascend 310P (Atlas 300I Duo, TWO cards = 4 chips visible 0-3).
+#
+# Why two cards: a single Duo card (2 x ~21 GB) cannot co-reside the INT8
+# encoder (stage 0, ~18.4 GB/chip measured) with the INT8 DiT (stage 1,
+# ~16.5 GB/chip) plus VAE (stage 2) and the DiT activation slabs — measured
+# OOM at stage-1 shard-load with stage 0 resident. All three stages of the
+# disaggregated pipeline live in ONE orchestrator engine, so the placement
+# must be one container seeing both cards (ASCEND_RT_VISIBLE_DEVICES=0,1,2,3).
+#
+# Chip ledger (per chip):
+# * C2 chips 0,1 — stage 0 AR encoder INT8 TP2 only:
+#   18.4 GB weights + 1.2 GB CANN baseline + KV pool sized by mmu 0.93
+#   (~1.2 GB, covers the official-min t2va prompt at max_model_len 2048).
+#   Tuning carried over from the standalone INT8 encoder proof:
+#   max_num_batched_tokens 1024, max_num_seqs 2, enforce_eager.
+# * C3 chips 2,3 — stage 1 DiT INT8 TP2 WITH DLO + stage 2 VAE TP2 tiled:
+#   DLO streams the int8 DiT weights from host RAM per layer (active slab
+#   ~2-3 GB/chip) because resident 16.5 GB + VAE 2.75 GB + baseline would
+#   leave <1 GB for the DiT's ~28K-token-sequence activations (the attention
+#   math fallback materializes a ~1.6 GB S x S score slab at 768p/5s).
+#   Cost: ~33 GB/step host->NPU streaming (PCIe, partially overlapped).
+#   VAE resident 2.75 GB/chip; ~14 GB/chip headroom for activations.
+# * Cross-card traffic: encoder hidden payload only (~5-20 MB via HCCL/PCIe).
+#
+# Everything else (INT8 stage 0 via quantization: ascend + FL2VA_int8/text_encoder,
+# stage 1 online INT8 via diffusion_quantization_config, FP16 runtime,
+# TORCH_SDPA math-fallback attention, ulysses_degree 1) follows the
+# single-card 310P line — see minimax_h3_310p_tp2_decode.yaml header.
+pipeline: minimax_h3_disaggregated_decode
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.93
+    max_model_len: 2048
+    max_num_seqs: 2
+    max_num_batched_tokens: 1024
+    enforce_eager: true
+    quantization: ascend
+    model: /models/FL2VA_int8/text_encoder
+    hf_overrides:
+      minimax_h3_encoder_components:
+        text_encoder:
+          parallel_mode: tp
+        video_vae:
+          parallel_mode: patch
+        audio_vae:
+          parallel_mode: leader
+    default_sampling_params:
+      detokenize: false
+      max_tokens: 1
+      temperature: 0.0
+  - stage_id: 1
+    devices: "2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    enable_distributed_layerwise_offload: true
+    model_loaded:
+      text_encoder: false
+      vae_encoder: false
+      vae_decoder: false
+    parallel_config:
+      tensor_parallel_size: 2
+      ulysses_degree: 1
+      vae_patch_parallel_size: 1
+    diffusion_quantization_config:
+      transformer:
+        method: int8
+    default_sampling_params:
+      num_inference_steps: 50
+      seed: 42
+  - stage_id: 2
+    devices: "2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    parallel_config:
+      tensor_parallel_size: 2
+      ulysses_degree: 1
+      vae_patch_parallel_size: 2
+      vae_parallel_mode: tile
+    vae_use_tiling: true
+    default_sampling_params:
+      seed: 42
