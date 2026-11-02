@@ -450,6 +450,53 @@ def apply_talker_patches() -> None:
     _PATCHED_TALKER = True
 
 
+def _install_decoder_slot_reset_patch() -> None:
+    """aclnn ``inplace_index_fill`` has no DT_INT64 support (EZ1001).
+
+    The decoder streaming-state slot offsets are created in int64 by the
+    shared module (CUDA semantics); on NPU the ``index_fill_`` that marks a
+    reused ring slot invalid fails with
+    ``AclNN_Parameter_Error(EZ1001): Tensor self not implemented for
+    DT_INT64``. The 310P codec patch runs the fill through an int32
+    mirror and copies the result back, keeping the shared buffer's dtype
+    and every CUDA code path untouched.
+    """
+    from vllm_omni.model_executor.models.moss_tts import (
+        audio_tokenizer as _moss_audio_tokenizer,
+    )
+
+    _tok_cls = _moss_audio_tokenizer.MossAudioTokenizerModel
+    if getattr(_tok_cls, "_moss_310p_slot_reset", False):
+        return
+
+    def reset_decoder_state_slots(self, state_slot_ids):
+        if not self._decoder_streaming_attentions or self._decoder_slot_offsets is None:
+            raise RuntimeError("MOSS Audio Tokenizer decoder state pool is not initialized.")
+        if state_slot_ids.numel() == 0:
+            return
+        if state_slot_ids.device.type == "cpu":
+            min_slot = int(state_slot_ids.min())
+            max_slot = int(state_slot_ids.max())
+            if min_slot < 0 or max_slot >= self._decoder_state_capacity:
+                raise ValueError(
+                    f"Decoder state slots must be in [0, {self._decoder_state_capacity}), "
+                    f"got {state_slot_ids.tolist()}"
+                )
+        slots = state_slot_ids.to(device=self._decoder_slot_offsets.device, dtype=torch.long)
+        offsets = self._decoder_slot_offsets
+        # A zero offset marks every old ring-cache entry invalid, so the large
+        # KV buffers do not need to be cleared when a slot is reused.
+        if str(offsets.device).startswith("npu") and offsets.dtype == torch.long:
+            mirror = offsets.to(torch.int32)
+            mirror.index_fill_(1, slots.to(torch.int32), 0)
+            offsets.copy_(mirror)
+        else:
+            offsets.index_fill_(1, slots, 0)
+
+    reset_decoder_state_slots._moss_310p_slot_reset = True  # type: ignore[attr-defined]
+    _tok_cls.reset_decoder_state_slots = reset_decoder_state_slots  # type: ignore[method-assign]
+
+
 def apply_codec_patches() -> None:
     """Install the 310P MOSS-TTS codec patches (decoder + fused-op shim)."""
     global _PATCHED_CODEC
@@ -459,5 +506,6 @@ def apply_codec_patches() -> None:
 
     modeling_moss_tts_codec.MossTTSCodecDecoder = _MossTTSCodecDecoder310P
     _install_310p_torch_npu_shim()
+    _install_decoder_slot_reset_patch()
 
     _PATCHED_CODEC = True
