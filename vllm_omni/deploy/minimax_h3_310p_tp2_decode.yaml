@@ -1,11 +1,20 @@
 # MiniMax H3 on Ascend 310P (Atlas 300I Duo, one card = 2 chips, HCCS).
 #
 # 310P placement ledger (POLICY §2 INT8 tier; 21589/21005 MB per chip):
-# * stage 0 (Qwen3-VL-32B text encoder, AR engine): FP16 + layerwise offload
-#   (weights resident on host ~66.7 GB; per-chip NPU footprint = active slab +
-#   small KV only). BF16/FP16 TP2 residency is impossible: 33.4 GB/chip >
-#   21.6 GB chip budget. gpu_memory_utilization is kept minimal (t2va encode
-#   sequences are short, max_tokens=1) so the KV pool cannot crowd stage 1.
+# * stage 0 (Qwen3-VL-32B text encoder, AR engine): W8A8_DYNAMIC INT8.
+#   FP16 TP2 residency is impossible (33.4 GB/chip > 21.6 GB chip budget) and
+#   the AR engine path has NO layerwise offload: llm_ar stage ownership does
+#   not include enable_layerwise_offload (the config resolver rejects it) and
+#   NPUARWorker has no host-streaming support. The encoder therefore ships as
+#   a per-channel symmetric INT8 checkpoint (448 linears, language model only;
+#   visual tower / embeddings / lm_head stay FP16): ~30 GB int8 + ~5 GB fp16
+#   remainder -> ~18 GB/chip at TP2. Runtime uses npu_dynamic_quant +
+#   npu_quant_matmul (same 310P kernel family as the stage-1 INT8 line).
+#   Quantization config: FL2VA/text_encoder_int8/config.json:quantization_config
+#   (quant_method "ascend", per-linear "W8A8_DYNAMIC" = 310P ModelSlim
+#   registry key), mirrored in quantization_config.json.
+#   gpu_memory_utilization is kept minimal (t2va encode sequences are short,
+#   max_tokens=1) so the KV pool cannot crowd stage 1.
 # * stage 1 (33.1B DiT, diffusion): online INT8 W8A8
 #   (DiffusionInt8Config, npu_quant_matmul path). tensor_parallel_size=2 keeps
 #   the AdaLN wide projections (out=96768) under the npu_quant_matmul
@@ -38,7 +47,8 @@ stages:
     max_model_len: 8192
     max_num_seqs: 1
     enforce_eager: true
-    enable_layerwise_offload: true
+    quantization: ascend
+    model: /models/FL2VA_int8/text_encoder
     hf_overrides:
       minimax_h3_encoder_components:
         text_encoder:
@@ -63,7 +73,9 @@ stages:
       tensor_parallel_size: 2
       ulysses_degree: 1
       vae_patch_parallel_size: 1
-    diffusion_quantization_config: '{"transformer":{"method":"int8"}}'
+    diffusion_quantization_config:
+      transformer:
+        method: int8
     default_sampling_params:
       num_inference_steps: 50
       seed: 42

@@ -149,7 +149,31 @@ class MiniMaxH3DiTArchConfig:
 
 
 _ARCH_DEFAULTS = MiniMaxH3DiTArchConfig()
-_BF16_DTYPE = torch.bfloat16
+
+
+def _resolve_h3_runtime_dtype() -> torch.dtype:
+    """Module dtype for the H3 DiT.
+
+    Upstream MiniMax-H3 pins bf16 (params and activation casts alike).  On
+    Ascend 310P the INT8 W8A8 kernel chain (``npu_dynamic_quant`` /
+    ``npu_quant_matmul``) accepts FP16 only -- ``aclnnDynamicQuantV2`` rejects
+    DT_BFLOAT16 with AclNN_Parameter_Error(EZ1001), whitelist
+    [DT_FLOAT16] -- so the online-INT8 path cannot quantize bf16 weights at
+    load nor bf16 activations at runtime.  On 310P the module dtype therefore
+    flips to fp16 (the 310P image runs models in fp16 anyway); 910-series and
+    GPU keep the upstream bf16 default.
+    """
+    try:
+        import torch_npu
+
+        if torch_npu.npu.is_available() and "310" in torch_npu.npu.get_device_name(0):
+            return torch.float16
+    except Exception:
+        pass
+    return torch.bfloat16
+
+
+_BF16_DTYPE = _resolve_h3_runtime_dtype()
 _FP32_DTYPE = torch.float32
 
 MINIMAX_H3_FP32_PARAM_NAMES = frozenset(
