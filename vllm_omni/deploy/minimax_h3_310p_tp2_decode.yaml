@@ -1,0 +1,81 @@
+# MiniMax H3 on Ascend 310P (Atlas 300I Duo, one card = 2 chips, HCCS).
+#
+# 310P placement ledger (POLICY §2 INT8 tier; 21589/21005 MB per chip):
+# * stage 0 (Qwen3-VL-32B text encoder, AR engine): FP16 + layerwise offload
+#   (weights resident on host ~66.7 GB; per-chip NPU footprint = active slab +
+#   small KV only). BF16/FP16 TP2 residency is impossible: 33.4 GB/chip >
+#   21.6 GB chip budget. gpu_memory_utilization is kept minimal (t2va encode
+#   sequences are short, max_tokens=1) so the KV pool cannot crowd stage 1.
+# * stage 1 (33.1B DiT, diffusion): online INT8 W8A8
+#   (DiffusionInt8Config, npu_quant_matmul path). tensor_parallel_size=2 keeps
+#   the AdaLN wide projections (out=96768) under the npu_quant_matmul
+#   per-partition limit of 65535, so no unquantized fallback layers are
+#   expected (verified by load-time warning scan; if any appear, DLO is the
+#   contingency: enable_distributed_layerwise_offload streams int8 weights +
+#   fallback weights from host).
+#   Weights ~16.6 GB/chip + SP activations + driver baseline fit the 21.6 GB
+#   chip1 budget with DLO as the overflow lever.
+# * stage 2 (video+audio VAE decode): TP2 tiled; weights 5.5 GB/chip resident
+#   only during the decode stage (disaggregated decode keeps VAE out of the
+#   DiT step budget).
+#
+# Attention: TORCH_SDPA generic path (POLICY §6; no MindIE-SD in the 310P
+# image, find_spec("mindiesd") is None). ulysses_degree=1 on both stages to
+# avoid the USP paged-FIA backend on 310P (unvalidated); sequence length at
+# the 768p/5s benchmark shape is handled in-chip by the dense path.
+#
+# dtype: float16 is pinned explicitly at serve time (--dtype float16;
+# 310P is FP16-only, BF16 is rejected at the hardware level, POLICY §2).
+pipeline: minimax_h3_disaggregated_decode
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+stages:
+  - stage_id: 0
+    devices: "0,1"
+    tensor_parallel_size: 2
+    gpu_memory_utilization: 0.05
+    max_model_len: 8192
+    max_num_seqs: 1
+    enforce_eager: true
+    enable_layerwise_offload: true
+    hf_overrides:
+      minimax_h3_encoder_components:
+        text_encoder:
+          parallel_mode: tp
+        video_vae:
+          parallel_mode: patch
+        audio_vae:
+          parallel_mode: leader
+    default_sampling_params:
+      detokenize: false
+      max_tokens: 1
+      temperature: 0.0
+  - stage_id: 1
+    devices: "0,1"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_loaded:
+      text_encoder: false
+      vae_encoder: false
+      vae_decoder: false
+    parallel_config:
+      tensor_parallel_size: 2
+      ulysses_degree: 1
+      vae_patch_parallel_size: 1
+    diffusion_quantization_config: '{"transformer":{"method":"int8"}}'
+    default_sampling_params:
+      num_inference_steps: 50
+      seed: 42
+  - stage_id: 2
+    devices: "0,1"
+    max_num_seqs: 1
+    enforce_eager: true
+    parallel_config:
+      tensor_parallel_size: 2
+      ulysses_degree: 1
+      vae_patch_parallel_size: 2
+      vae_parallel_mode: tile
+    vae_use_tiling: true
+    default_sampling_params:
+      seed: 42
