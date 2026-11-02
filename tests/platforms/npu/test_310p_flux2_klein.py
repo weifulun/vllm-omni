@@ -403,6 +403,13 @@ def _install_parent_fakes(monkeypatch: pytest.MonkeyPatch):
         "vllm_omni.platforms.npu._310p.patch",
     ):
         _install_fake_module(monkeypatch, name)
+    # Shared MATH-SDPA hardware shim (shared-asset chain): apply() imports
+    # it unconditionally, so the fake chain must carry a no-op entry.
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.platforms.npu._310p.patch.attention",
+        maybe_patch_sdpa_math=lambda: None,
+    )
 
 
 def test_registry_dispatches_by_model_class_name(monkeypatch: pytest.MonkeyPatch):
