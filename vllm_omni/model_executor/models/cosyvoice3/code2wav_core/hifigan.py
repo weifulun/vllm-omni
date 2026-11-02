@@ -26,6 +26,24 @@ from torch.distributions.uniform import Uniform
 
 from vllm_omni.model_executor.models.common.snake_activation import Snake
 
+
+def _is_310p_device(tensor: torch.Tensor) -> bool:
+    """True when ``tensor`` lives on an Ascend 310P NPU.
+
+    310P's aclnn operator package has no dynamic-shape kernel for the
+    interpolate/ResizeD path (Config_Error EZ1013), so the 310P vocoder code
+    uses exact integer-scale tensor equivalents there.  Import failures
+    (non-NPU deployments, no vllm_ascend) simply keep the upstream path.
+    """
+    if tensor.device.type != "npu":
+        return False
+    try:
+        from vllm_omni.platforms.npu._310p import is_310p
+
+        return bool(is_310p())
+    except Exception:
+        return False
+
 """hifigan based generator implementation.
 
 This code is modified from https://github.com/jik876/hifi-gan
@@ -394,20 +412,49 @@ class SineGen2(torch.nn.Module):
 
         # instantanouse phase sine[t] = sin(2*pi \sum_i=1 ^{t} rad)
         if not self.flag_for_pulse:
-            rad_values = torch.nn.functional.interpolate(
-                rad_values.transpose(1, 2), scale_factor=1 / self.upsample_scale, mode="linear"
-            ).transpose(1, 2)
+            if _is_310p_device(f0_values):
+                # 310P's aclnn operator package has no dynamic-shape kernel
+                # for the interpolate/ResizeD path (EZ1013), so use the exact
+                # integer-scale equivalents instead: linear downsample by an
+                # integer factor s == stride slice (linear interpolation at
+                # exact sample positions), and causal nearest upsample by s
+                # == repeat-each-value-s-times via expand/reshape.  Both are
+                # mathematically identical to the F.interpolate calls below
+                # for integer scale factors.
+                s = self.upsample_scale
+                rad_values = (
+                    rad_values.transpose(1, 2)[:, :, ::s].transpose(1, 2)
+                )
 
-            cum = torch.cumsum(rad_values, dim=1)
-            phase = cum if phase_acc is None else cum + phase_acc
-            new_phase_acc = _carry_phase_at_boundary(phase, phase_acc, next_overlap, dim=1, trim=trim)
-            phase = phase * 2 * np.pi
-            phase = torch.nn.functional.interpolate(
-                phase.transpose(1, 2) * self.upsample_scale,
-                scale_factor=self.upsample_scale,
-                mode="nearest" if self.causal is True else "linear",
-            ).transpose(1, 2)
-            sines = torch.sin(phase)
+                cum = torch.cumsum(rad_values, dim=1)
+                phase = cum if phase_acc is None else cum + phase_acc
+                new_phase_acc = _carry_phase_at_boundary(
+                    phase, phase_acc, next_overlap, dim=1, trim=trim
+                )
+                phase = phase * 2 * np.pi
+                p = phase.transpose(1, 2) * s
+                phase = (
+                    p.unsqueeze(-1)
+                    .expand(p.shape[0], p.shape[1], p.shape[2], s)
+                    .reshape(p.shape[0], p.shape[1], p.shape[2] * s)
+                    .transpose(1, 2)
+                )
+                sines = torch.sin(phase)
+            else:
+                rad_values = torch.nn.functional.interpolate(
+                    rad_values.transpose(1, 2), scale_factor=1 / self.upsample_scale, mode="linear"
+                ).transpose(1, 2)
+
+                cum = torch.cumsum(rad_values, dim=1)
+                phase = cum if phase_acc is None else cum + phase_acc
+                new_phase_acc = _carry_phase_at_boundary(phase, phase_acc, next_overlap, dim=1, trim=trim)
+                phase = phase * 2 * np.pi
+                phase = torch.nn.functional.interpolate(
+                    phase.transpose(1, 2) * self.upsample_scale,
+                    scale_factor=self.upsample_scale,
+                    mode="nearest" if self.causal is True else "linear",
+                ).transpose(1, 2)
+                sines = torch.sin(phase)
         else:
             # If necessary, make sure that the first time step of every
             # voiced segments is sin(pi) or cos(0)
