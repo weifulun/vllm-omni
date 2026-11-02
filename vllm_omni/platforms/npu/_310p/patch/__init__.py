@@ -22,6 +22,13 @@ _QWEN3_TTS_CODE2WAV_ARCH = "Qwen3TTSCode2Wav"
 # apply_diffusion_310p_patches() unchanged.
 _DIFFUSION_310P_PATCH_MODULES: dict[str, list[str]] = {
     "StableDiffusionXLPipeline": ["vllm_omni.platforms.npu._310p.patch.sdxl"],
+    # LTX-2.5 (task-21): the one-stage Full/SFT, distilled one-stage, and the
+    # two-stage variants share the 310P invariants (FP16, ConvVAE, VAE
+    # tiling, INT8 tier gate, encoder placement).
+    "LTX2Pipeline": ["vllm_omni.platforms.npu._310p.patch.ltx25"],
+    "LTX2DistilledOneStagePipeline": ["vllm_omni.platforms.npu._310p.patch.ltx25"],
+    "LTX2TwoStagePipeline": ["vllm_omni.platforms.npu._310p.patch.ltx25"],
+    "LTX2DistilledTwoStagePipeline": ["vllm_omni.platforms.npu._310p.patch.ltx25"],
 }
 
 
