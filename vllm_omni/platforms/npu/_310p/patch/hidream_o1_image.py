@@ -81,6 +81,10 @@ _APPLIED = False
 _ATTENTION_GUARD_INSTALLED = False
 _PIPELINE_PATCHED = False
 _FP16_SOFTMAX_SWAPPED = False
+# Reduce-dim chunk for the fp16 softmax row sum; bounds the torch_npu reduce
+# workspace (see _math_sdpa_fp16_softmax).  512 keeps it <= ~540 MB at the
+# 2048^2 sequence length (S=4128) while staying a single chunk for small S.
+_FP16_SOFTMAX_ROW_SUM_CHUNK = 512
 
 
 def _pipeline_module():
@@ -474,11 +478,20 @@ def _math_sdpa_fp16_softmax(query, key, value, attention_mask, causal, scale):
     max-subtraction for numerical stability, so only the one fp16 S x S
     score buffer is ever live (peak buffer halved ~1.09 GiB).
 
+    The row sum is reduced in chunks along the reduced dim: torch_npu's
+    reduce materializes an ~2x-fp32 workspace for the whole S x S tensor
+    (measured 4.06 GiB at S=4128 on 310P C1 -> OOM even on the fp16 tier);
+    chunking bounds it to ~CHUNK/S of that and the partial sums accumulate
+    in fp32 before the in-place divide.
+
     Precision note (MANDATORY in the report): the softmax accumulate drops
     from fp32 to fp16 - the attention logits here are bounded (~|z| < 5), so
-    fp16 exp is numerically safe and the relative error is ~1e-3.  This only
-    changes the attention-layer accumulate precision on 310P; it is scoped to
-    this model's process and leaves the SDXL/Cosmos lines untouched.
+    fp16 exp is numerically safe and the relative error is ~1e-3; the row
+    sum accumulates in fp32 but the final divisor is cast back to fp16 for
+    the in-place divide, adding <= half an fp16 ulp of the row sum (~2.4e-4
+    relative at S=4128).  This only changes the attention-layer accumulate
+    precision on 310P; it is scoped to this model's process and leaves the
+    SDXL/Cosmos lines untouched.
     """
     # GQA: expand KV heads to match query heads (mirrors _math_sdpa).
     if query.shape[1] != key.shape[1]:
@@ -505,7 +518,18 @@ def _math_sdpa_fp16_softmax(query, key, value, attention_mask, causal, scale):
     row_max = attn.max(dim=-1, keepdim=True).values
     attn.sub_(row_max)
     attn.exp_()
-    attn.div_(attn.sum(dim=-1, keepdim=True))
+    # Row sum in chunks along the reduced dim.  torch_npu's reduce materializes
+    # an ~2x-fp32 workspace for the whole S x S tensor (measured 4.06 GiB at
+    # S=4128 on 310P C1 -> OOM even on the fp16 tier); chunking bounds it to
+    # ~CHUNK/S of that (<= ~540 MB) and accumulates the partial sums in fp32.
+    seq = attn.shape[-1]
+    chunk = min(_FP16_SOFTMAX_ROW_SUM_CHUNK, seq)
+    row_sum = attn[..., :chunk].contiguous().sum(dim=-1, keepdim=True).float()
+    for i in range(chunk, seq, chunk):
+        row_sum = row_sum + attn[..., i:i + chunk].contiguous().sum(
+            dim=-1, keepdim=True
+        ).float()
+    attn.div_(row_sum.to(attn.dtype))
 
     return torch.matmul(attn, value)
 

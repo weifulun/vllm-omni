@@ -690,6 +690,23 @@ def test_fp16_softmax_causal_and_gqa(monkeypatch):
     assert out[0, 0, 0].abs().sum().item() > 0
 
 
+def test_fp16_softmax_multi_chunk_row_sum(monkeypatch):
+    """S > _FP16_SOFTMAX_ROW_SUM_CHUNK exercises the multi-chunk row-sum loop
+    (the 2048^2 operating point runs S=4128, i.e. 9 chunks on 310P)."""
+    mod = _fresh_patch_module(monkeypatch)
+    chunk = mod._FP16_SOFTMAX_ROW_SUM_CHUNK
+    seq = chunk * 2 + 17  # 3 chunks: full, full, partial
+    torch.manual_seed(2)
+    q = torch.randn(1, 2, seq, 16, dtype=torch.float16)
+    k = torch.randn(1, 2, seq, 16, dtype=torch.float16)
+    v = torch.randn(1, 2, seq, 16, dtype=torch.float16)
+    scale = 1.0 / 16**0.5
+    mask = torch.randn(1, 1, seq, seq, dtype=torch.float16)
+    out = mod._math_sdpa_fp16_softmax(q, k, v, mask, causal=False, scale=scale)
+    ref = _fp32_reference(q, k, v, causal=False, scale=scale, mask=mask)
+    assert torch.allclose(out.float(), ref, atol=5e-3, rtol=5e-3)
+
+
 def test_fp16_softmax_swap_gate_off_by_default(monkeypatch):
     patch_mod, captured = _apply(monkeypatch)
     sentinel = captured["sdpa_module"]._sdpa_attention
