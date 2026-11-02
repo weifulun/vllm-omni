@@ -55,7 +55,6 @@ def maybe_patch_310p_mrope() -> None:
         return
 
     try:
-        from vllm.model_executor.layers.rotary_embedding import MRotaryEmbedding
         from vllm_ascend.ops import rotary_embedding as _ascend_rotary
     except ImportError:
         return
@@ -64,10 +63,33 @@ def maybe_patch_310p_mrope() -> None:
     if getattr(cls, "_auk_310p_mrope_patched", False):
         _PATCHED = True
         return
-    cls.forward_oot = MRotaryEmbedding.forward_oot
+
+    # IMPORTANT: resolve the torch-native implementation through the MRO, not
+    # through ``from vllm... import MRotaryEmbedding`` — both vllm-ascend and
+    # vllm-omni swap that module-level symbol (the name points at their own
+    # subclasses), so a symbol import silently re-fetches the aclnn-based
+    # implementation and the assignment becomes a no-op (observed node 128:
+    # patch log fires, identical npu_mrope crash).  The MRO is fixed at class
+    # definition time: the first non-ascend base IS vLLM's own MRotaryEmbedding,
+    # whose forward_oot delegates to forward_native (pure torch).
+    base = None
+    for cand in cls.__mro__[1:]:
+        if cand.__name__ == "MRotaryEmbedding" and cand.__module__.startswith(
+            "vllm.model_executor"
+        ):
+            base = cand
+            break
+    if base is None:
+        logger.warning(
+            "[310P] MRoPE patch: no vLLM MRotaryEmbedding base found in MRO; "
+            "leaving the aclnn fast path in place."
+        )
+        return
+    cls.forward_oot = base.forward_oot
     cls._auk_310p_mrope_patched = True
     _PATCHED = True
     logger.info(
-        "[310P] MRoPE routed to torch-native forward_oot "
-        "(aclnn RopeWithSinCosCacheV2 has no 310P kernel, EZ1001)."
+        "[310P] MRoPE routed to torch-native forward_oot via %s.forward_oot "
+        "(aclnn RopeWithSinCosCacheV2 has no 310P kernel, EZ1001).",
+        base.__module__,
     )

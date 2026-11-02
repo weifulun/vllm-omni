@@ -312,18 +312,22 @@ def _install_rotary_fakes(monkeypatch, is_310p_value: bool):
 
     # Fresh class objects per test: the patch rewrites class attributes in
     # place, so a module-level shared class would leak state between tests.
-    class _FakeBaseMRoPE:
+    class MRotaryEmbedding:  # noqa: N801
+        """Fake of the genuine vLLM base (module check in the patch)."""
+
+        __module__ = "vllm.model_executor.layers.rotary_embedding.mrope"
+
         def forward_oot(self, positions, query, key):  # noqa: N803
             return ("torch-native", positions, query, key)
 
-    class _FakeAscendMRoPE:
+    class _FakeAscendMRoPE(MRotaryEmbedding):
         """Stand-in for vllm_ascend.ops.rotary_embedding.AscendMRotaryEmbedding."""
 
         def forward_oot(self, positions, query, key):  # noqa: N803
             return ("ascend-fast-path", positions, query, key)
 
     _install_fake_module(
-        monkeypatch, "vllm.model_executor.layers.rotary_embedding", MRotaryEmbedding=_FakeBaseMRoPE,
+        monkeypatch, "vllm.model_executor.layers.rotary_embedding", MRotaryEmbedding=MRotaryEmbedding,
     )
     for name in ("vllm_ascend", "vllm_ascend.ops"):
         monkeypatch.setitem(sys.modules, name, _install_fake_module(monkeypatch, name))
@@ -337,7 +341,7 @@ def _install_rotary_fakes(monkeypatch, is_310p_value: bool):
         "vllm_omni.platforms.npu._310p",
         is_310p=lambda device=None: is_310p_value,
     )
-    return _FakeBaseMRoPE, _FakeAscendMRoPE
+    return MRotaryEmbedding, _FakeAscendMRoPE
 
 
 def _load_rotary_patch(monkeypatch):
