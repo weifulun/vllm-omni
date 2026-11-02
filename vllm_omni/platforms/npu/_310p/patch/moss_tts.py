@@ -38,6 +38,8 @@ Stage-1 codec arch (shared by every variant): ``MossTTSCodecDecoder``.
 
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn.functional as F
 import torch_npu
@@ -59,6 +61,14 @@ _NEG_INF_FP16 = -torch.finfo(torch.float16).max
 
 _PATCHED_TALKER = False
 _PATCHED_CODEC = False
+
+# Parity-smoke gate: audio-code sampling on 310P (like the 910 path) uses the
+# device-global RNG, so two identical runs are *not* bit-identical by model
+# design. MOSS_DETERMINISTIC_SAMPLING=1 switches the Delay talker's audio-head
+# sampling to greedy argmax (pure function of the logits) so same-input
+# parity checks validate the patch path bit-for-bit. Off by default:
+# production runs keep the stochastic sampling.
+_DETERMINISTIC_SAMPLING = os.environ.get("MOSS_DETERMINISTIC_SAMPLING") == "1"
 
 
 # ===================================================================
@@ -121,6 +131,8 @@ class _MossTTSDelayTalker310P(modeling_moss_tts_talker.MossTTSDelayTalkerForGene
             return logits.argmax(dim=-1)
         probs = F.softmax(logits, dim=-1, dtype=torch.float32)
         flat = probs.reshape(-1, probs.shape[-1])
+        if _DETERMINISTIC_SAMPLING:
+            return flat.argmax(dim=-1).reshape(probs.shape[:-1])
         # One shared global generator: parity with the 910 path, which also
         # sampled the audio heads with the device-global RNG (request seeds
         # only drive the vLLM-managed text head).
@@ -174,6 +186,9 @@ class _MossTTSDelayTalker310P(modeling_moss_tts_talker.MossTTSDelayTalkerForGene
                     active_logits,
                 )
             probs = F.softmax(active_logits, dim=-1, dtype=torch.float32)
+            if _DETERMINISTIC_SAMPLING:
+                codes[active_idx] = probs.argmax(dim=-1).long()
+                return codes
             codes[active_idx] = random_sample(probs, {}).long()
             return codes
 
