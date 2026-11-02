@@ -26,8 +26,10 @@ the platform already defaults to ``TORCH_SDPA`` on NPU.  ``FLASH_ATTN``
 
 from __future__ import annotations
 
+import json
 import logging
 import os
+import time
 
 import torch
 
@@ -54,6 +56,41 @@ __all__ = [
 def _encoder_on_npu() -> bool:
     """Opt out of CPU encoder pinning for A/B experiments."""
     return os.environ.get(_ENCODER_ON_NPU_ENV, "0") == "1"
+
+
+def _maybe_install_phase_tracer(pipeline) -> None:
+    """Diagnostic: per-phase wall time from inside the diffusion worker.
+
+    The Omni client process cannot reach the worker-side pipeline object, so
+    the engine-side phase timers live here.  ``VLLM_OMNI_310P_TRACE_PHASES=1``
+    wraps ``unet.forward`` / ``vae.decode`` with NPU-synced timers and
+    appends one JSON line per call to ``VLLM_OMNI_310P_PHASES_FILE``
+    (default ``/tmp/310p_phases.jsonl``); the runner ingests and clears the
+    file between repeats.
+    """
+    if os.environ.get("VLLM_OMNI_310P_TRACE_PHASES", "0") != "1":
+        return
+    path = os.environ.get("VLLM_OMNI_310P_PHASES_FILE", "/tmp/310p_phases.jsonl")
+    device = pipeline.device
+
+    def _record(kind: str, fn):
+        def traced(*args, **kwargs):
+            torch.npu.synchronize(device)
+            t0 = time.perf_counter()
+            out = fn(*args, **kwargs)
+            torch.npu.synchronize(device)
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps({kind: time.perf_counter() - t0}) + "\n")
+            except OSError:
+                pass
+            return out
+
+        return traced
+
+    pipeline.unet.forward = _record("unet_s", pipeline.unet.forward)
+    pipeline.vae.decode = _record("vae_decode_s", pipeline.vae.decode)
+    logger.info("[310P] phase tracer -> %s", path)
 
 
 class _StableDiffusionXL310P(StableDiffusionXLPipeline):
@@ -84,6 +121,7 @@ class _StableDiffusionXL310P(StableDiffusionXLPipeline):
                 self.device,
                 _RUNTIME_DTYPE,
             )
+        _maybe_install_phase_tracer(self)
 
     def _get_clip_prompt_embeds(
         self,
