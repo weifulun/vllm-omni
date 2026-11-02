@@ -13,7 +13,11 @@ def is_310p(device: torch.device | None = None) -> bool:
     if device is not None and device.type != "npu":
         return False
     try:
-        from vllm_ascend.utils import is_310p as ascend_is_310p
+        # 310P image ships a main-line vllm_ascend build (0.19.1rc2.dev2959,
+        # git 450e55698) where is_310p moved to device.device_config; the
+        # tag path vllm_ascend.utils raises ImportError and would silently
+        # disable every 310P gate (baseline task-4 evidence, lead-approved).
+        from vllm_ascend.device.device_config import is_310p as ascend_is_310p
 
         return bool(ascend_is_310p())
     except (ImportError, AttributeError):

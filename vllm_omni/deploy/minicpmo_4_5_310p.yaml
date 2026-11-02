@@ -12,12 +12,12 @@
 #   * right-sizes the per-chip memory budget for the measured 21589 MiB
 #     usable per chip (see RISKS.md "VRAM budget").
 #
-# Real-device TODO(310P-real) knobs that are intentionally left at their base
-# values until first boots: stage 0 PIECEWISE / stage 1 FULL_DECODE_ONLY
-# cudagraph modes (the 310P model runner owns graph capture; flip to
-# enforce_eager: true on a capture failure) and stage 1 speculative_config
-# (K=8 multi-frame decode; fallback is dropping it — one codec frame per
-# step).
+# Real-device TODO(310P-real) resolution (128 C1 first boot, 2026-11-02):
+# stage 0 PIECEWISE compiled decode failed on 310P (rope cos null under
+# AOTAutograd partition) -> stage 0 runs enforce_eager: true below. Stage 1
+# FULL_DECODE_ONLY cudagraph / speculative K=8 remain at base values pending
+# the first successful stage 0 boot (fallbacks: enforce_eager / drop
+# speculative_config).
 
 base_config: minicpmo_4_5.yaml
 dtype: float16
@@ -28,6 +28,12 @@ stages:
     devices: "0,1"
     gpu_memory_utilization: 0.68
     max_model_len: 8192
+    # Real-device first boot (128 C1, 2026-11-02): the base PIECEWISE
+    # compiled decode fails on 310P — aclnnApplyRotaryPosEmbV2 gets a null
+    # cos tensor under the torch.compile/AOTAutograd partition
+    # (AclNN_Parameter_Error EZ1001 "Check cos != nullptr"). Documented
+    # TODO(310P-real) fallback: enforce_eager for this stage.
+    enforce_eager: true
   - stage_id: 1
     devices: "0"
   - stage_id: 2
