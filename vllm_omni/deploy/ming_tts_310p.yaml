@@ -1,60 +1,12 @@
 # Ming-3.0-tts-0.5B (dense) 310P deploy overlay (task-27, model-ming3).
 #
-# Same two-stage topology as ming_tts.yaml (stage-0 LLM+flow head ->
-# stage-1 audio VAE, async-chunk streaming). 310P is FP16-only (no BF16:
+# Thin overlay over the base pipeline deploy: 310P is FP16-only (no BF16:
 # AclNN EZ1001 exposes no DT_BFLOAT16), so dtype is pinned to float16.
+# The base already runs both stages on device "0" (single card), which is
+# the 310P single-chip shape under ASCEND_RT_VISIBLE_DEVICES=0; connectors
+# and stage geometry are inherited unchanged.
+#
 # The CFM CUDAGraph fast path stays off on NPU (is_cuda guard + the 310P
 # patch pins it off explicitly); the eager flow head is the contract.
-#
-# Single-chip 310P (21589 MB available per task-10 measurements): both
-# stages colocate on logical device 0 under ASCEND_RT_VISIBLE_DEVICES=0.
-pipeline: ming_tts
-async_chunk: true
-trust_remote_code: false
+base_config: ming_tts.yaml
 dtype: float16
-enable_prefix_caching: false
-
-connectors:
-  connector_of_shared_memory:
-    name: SharedMemoryConnector
-    extra:
-      latent_chunk_size: 25
-      initial_latent_chunk_size: 4
-      latent_left_context: 0
-
-stages:
-  - stage_id: 0
-    max_num_seqs: 1
-    gpu_memory_utilization: 0.45
-    enforce_eager: true
-    enable_prefix_caching: false
-    async_scheduling: false
-    max_num_batched_tokens: 8192
-    max_model_len: 8192
-    devices: "0"
-    output_connectors:
-      to_stage_1: connector_of_shared_memory
-    default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 512
-      detokenize: true
-
-  - stage_id: 1
-    max_num_seqs: 1
-    gpu_memory_utilization: 0.25
-    enforce_eager: true
-    enable_prefix_caching: false
-    async_scheduling: false
-    max_num_batched_tokens: 8192
-    max_model_len: 8192
-    devices: "0"
-    input_connectors:
-      from_stage_0: connector_of_shared_memory
-    default_sampling_params:
-      temperature: 0.0
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 1
-      detokenize: false

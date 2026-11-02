@@ -194,27 +194,45 @@ class TestDispatch:
 
 class TestDeployOverlay:
     def test_310p_overlay_pins_fp16_topology(self):
+        """Thin overlay over the base deploy: dtype flips to float16, all
+        runtime contracts (stages, connectors, pipeline) are inherited.
+        Mirrors the proven voxcpm2_310p.yaml convention (base_config + dtype)
+        and the loader's documented merge semantics (overlay scalars win).
+        """
         root = _repo_root()
-        overlay = root / "vllm_omni" / "deploy" / "ming_tts_310p.yaml"
-        base = root / "vllm_omni" / "deploy" / "ming_tts.yaml"
-        assert overlay.is_file(), "missing 310P deploy overlay"
+        overlay_path = root / "vllm_omni" / "deploy" / "ming_tts_310p.yaml"
+        base_path = root / "vllm_omni" / "deploy" / "ming_tts.yaml"
+        assert overlay_path.is_file(), "missing 310P deploy overlay"
 
         import yaml
 
-        with overlay.open() as f:
-            cfg = yaml.safe_load(f)
-        with base.open() as f:
-            base_cfg = yaml.safe_load(f)
+        with overlay_path.open() as f:
+            overlay = yaml.safe_load(f)
+        with base_path.open() as f:
+            base = yaml.safe_load(f)
 
-        assert cfg["dtype"] == "float16", "310P is FP16-only; overlay must pin float16"
-        assert base_cfg["dtype"] == "bfloat16", "base deploy stays BF16 for GPU lines"
-        assert cfg["pipeline"] == base_cfg["pipeline"] == "ming_tts"
-        assert cfg["async_chunk"] is True
-        assert [s["stage_id"] for s in cfg["stages"]] == [0, 1]
-        for stage in cfg["stages"]:
+        # The overlay must stay thin: only the base pointer + the dtype pin.
+        assert overlay["base_config"] == "ming_tts.yaml"
+        assert overlay["dtype"] == "float16", "310P is FP16-only; overlay must pin float16"
+        assert base["dtype"] == "bfloat16", "base deploy stays BF16 for GPU lines"
+
+        # Resolved contract (loader semantics: overlay scalars win, structured
+        # sections deep-merge — with a scalar-only overlay, inheritance is exact).
+        resolved = dict(base)
+        for key, value in overlay.items():
+            if key != "base_config":
+                resolved[key] = value
+
+        assert resolved["pipeline"] == "ming_tts"
+        assert resolved["async_chunk"] is True
+        stages = resolved["stages"]
+        assert [s["stage_id"] for s in stages] == [0, 1]
+        for stage in stages:
             assert stage["devices"] == "0", "single-chip 310P: both stages on logical device 0"
             assert stage["enforce_eager"] is True
-        # Connector geometry must match the base pipeline (latent chunk sizes).
-        extra = cfg["connectors"]["connector_of_shared_memory"]["extra"]
-        base_extra = base_cfg["connectors"]["connector_of_shared_memory"]["extra"]
-        assert extra == base_extra
+        assert stages[0]["gpu_memory_utilization"] == 0.45
+        assert stages[1]["gpu_memory_utilization"] == 0.25
+        # Connector geometry must be inherited from the base pipeline.
+        extra = resolved["connectors"]["connector_of_shared_memory"]["extra"]
+        assert extra["latent_chunk_size"] == 25
+        assert extra["initial_latent_chunk_size"] == 4
