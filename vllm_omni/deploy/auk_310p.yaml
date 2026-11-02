@@ -28,13 +28,20 @@ stages:
     # 310P single chip = ONE 310P3 die (21.08 GiB visible, measured via
     # torch.npu.mem_get_info on node 128).  The base config's 0.45 H200
     # sizing leaves 8.7 GiB of headroom above the 8.72 GiB thinker weights
-    # alone -> negative KV budget.  Raise utilization and shrink the
-    # encoder-cache budget (== max_num_batched_tokens) and the sequence
-    # cap: the thinker is a prefill-only encoder with max ~1.5K-token
-    # prompts in the AuK contract (<=30 s audio ~= <=500 audio tokens +
-    # text).  max_model_len must stay >= max_num_batched_tokens
-    # (vLLM SchedulerConfig validation, chunked prefill off).
-    gpu_memory_utilization: 0.92
+    # alone -> negative KV budget.  Shrink the encoder-cache budget (==
+    # max_num_batched_tokens) and the sequence cap: the thinker is a
+    # prefill-only encoder with max ~1.5K-token prompts in the AuK contract
+    # (<=30 s audio ~= <=500 audio tokens + text).  max_model_len must stay
+    # >= max_num_batched_tokens (vLLM SchedulerConfig validation, chunked
+    # prefill off).
+    #
+    # Utilization: the diffusion stage initializes FIRST (inline) and holds
+    # ~5.2 GiB on the same die, so free memory at stage-0 startup is ~15.9
+    # GiB, not 21.  0.92 fails the startup free-memory check (19.4 GiB
+    # desired); 0.73 targets 15.4 GiB, leaving ~1.5 GiB for KV blocks after
+    # weights (8.72) + encoder-cache budget + aclnn workspace — ample for a
+    # prefill-only stage.
+    gpu_memory_utilization: 0.73
     max_num_batched_tokens: 4096
     max_model_len: 4096
   - stage_id: 1
