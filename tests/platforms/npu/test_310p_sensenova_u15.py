@@ -459,7 +459,10 @@ def test_lm_block_stack_declared_for_layerwise_offload(monkeypatch: pytest.Monke
     module.apply_diffusion_310p_patches(od_config)
 
     lm_cls = captured["fake_lm_cls"]
-    assert list(lm_cls._layerwise_offload_blocks_attrs) == ["model.layers"]
+    assert list(lm_cls._layerwise_offload_blocks_attrs) == ["layers"]
+    # Discovery resolves via single-level getattr, so a "layers" accessor
+    # must exist on the class (the wrapper keeps the stack at model.layers).
+    assert isinstance(vars(lm_cls).get("layers"), property)
 
 
 def test_multi_chip_without_quant_is_not_patched_rejected(monkeypatch: pytest.MonkeyPatch):

@@ -772,10 +772,17 @@ def _build_310p_pipeline_cls():
     # layerwise offload backend finds no streamable blocks and falls back to
     # component.module.to(device) on the WHOLE 17.53B LM (35.07 GB) - an
     # immediate single-chip OOM ("Tried to allocate 194 MiB; 19.51 GiB in
-    # use", 127 C4).  Declare the 42-layer MoT stack as the block list so the
-    # backend streams one layer at a time (weights resident on host).
+    # use", 127 C4).  Declare the 42-layer MoT stack so the backend streams
+    # one layer at a time (weights resident on host).  Discovery resolves the
+    # name via a single-level getattr (upstream precedent: minimax_h3 "blocks",
+    # cosmos3 "layers"), so expose the nested self.model.layers as a class
+    # property named "layers" (the wrapper carries no own "layers" attr).
     if not getattr(SenseNovaU1ForCausalLM, "_layerwise_offload_blocks_attrs", None):
-        SenseNovaU1ForCausalLM._layerwise_offload_blocks_attrs = ["model.layers"]
+        if "layers" not in vars(SenseNovaU1ForCausalLM):
+            SenseNovaU1ForCausalLM.layers = property(  # type: ignore[prop-deletion]
+                lambda self: self.model.layers
+            )
+        SenseNovaU1ForCausalLM._layerwise_offload_blocks_attrs = ["layers"]
 
     cls = type(
         "_SenseNovaU15Pipeline310P",
