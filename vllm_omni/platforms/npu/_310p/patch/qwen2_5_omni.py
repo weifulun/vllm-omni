@@ -32,7 +32,6 @@ import os
 from collections.abc import Iterable
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 import torch_npu
 from vllm_ascend.utils import ACL_FORMAT_FRACTAL_NZ, aligned_16, nd_to_nz_2d
@@ -385,7 +384,6 @@ class _DiTAttention310P(qwen2_5_omni_token2wav.DiTAttention):
         look_ahead_block: int = 0,
     ) -> torch.Tensor:
         batch_size = hidden_states.shape[0]
-        seq_len = hidden_states.shape[1]
 
         qkv = self.qkv_proj(hidden_states)
         query, key, value = qkv.split([self.inner_dim, self.inner_dim, self.inner_dim], dim=-1)
