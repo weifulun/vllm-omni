@@ -62,10 +62,13 @@ stages:
     max_num_seqs: 2
     gpu_memory_utilization: 0.93
     dtype: float16
-    # The checkpoint's max_position_embeddings is 10240 and the whole song
-    # is decoded in-context. Prompt cap 5000 + frame budget 9000 overrun
-    # 10240 for max-length inputs (a property of the checkpoint).
-    max_model_len: 10240
+    # The checkpoint's max_position_embeddings is 10240. On this 21 GB chip
+    # the measured KV budget (jemalloc preloaded per the fleet's AR-engine
+    # note) tops out at an estimated 9344 positions, so max_model_len is
+    # pinned at 9216: the benchmark sequences are 1380 prompt + 3600 frames
+    # = 4980 positions, well inside, and the 9000-frame upstream budget was
+    # already unattainable on this chip (KV wall, report section 4).
+    max_model_len: 9216
     # One scheduler step must be able to prefill both rows of a pair
     # (2 x 5000 prompt tokens) so the cond/uncond pair stays step-locked.
     max_num_batched_tokens: 10240
