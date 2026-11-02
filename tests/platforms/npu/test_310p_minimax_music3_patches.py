@@ -177,6 +177,26 @@ def _install_minimax_fakes(monkeypatch: pytest.MonkeyPatch, root: Path):
         f"{pkg_name}.rvq_decoder",
         DepthDecoderBlock=type("DepthDecoderBlock", (nn.Module,), {}),
     )
+    class _FakePinnedIndexStage:
+        def __init__(self, rows: int, capacity: int, device) -> None:
+            self.capacity = capacity
+
+        def push(self, values, count):
+            return torch.tensor([list(values[0])[:count]], dtype=torch.int64)
+
+    class _FakeTalker(nn.Module):
+        def __init__(self) -> None:
+            super().__init__()
+            self.frame_feedback_active = torch.zeros(4, dtype=torch.bool)
+            self.frame_feedback_codes = torch.zeros((4, 3), dtype=torch.long)
+            self._feedback_stage = None
+            self._feedback_positions = None
+            self._feedback_codes = None
+            self._max_rows = 4
+
+        def _write_frame_feedback(self, feedback_rows, feedback_codes, device):
+            raise AssertionError("stock frame-feedback writer must be replaced")
+
     talker = _install_fake_module(
         monkeypatch,
         f"{pkg_name}.talker",
@@ -185,6 +205,8 @@ def _install_minimax_fakes(monkeypatch: pytest.MonkeyPatch, root: Path):
         draw_from_gumbel=sampling.draw_from_gumbel,
         gumbel_noise=sampling.gumbel_noise,
         sample_topk_seeded=sampling.sample_topk_seeded,
+        MiniMaxMusic3TalkerForConditionalGeneration=_FakeTalker,
+        PinnedIndexStage=_FakePinnedIndexStage,
     )
     _install_fake_module(
         monkeypatch,
@@ -678,3 +700,27 @@ def test_talker_embedding_offload_hook(monkeypatch):
     other = types.SimpleNamespace(model=_NotMusic3())
     patch._offload_talker_embeddings_310p(other)
     assert not other.model.touched
+
+
+def test_write_frame_feedback_twin_fills_flags_without_index_fill(monkeypatch):
+    """The 310P twin must publish frame feedback without the index_fill_
+    kernel (ACLNN 161002 gap) and keep the upstream flag semantics."""
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    patch.apply_talker_patches()
+
+    talker_cls = fakes["talker"].MiniMaxMusic3TalkerForConditionalGeneration
+    assert talker_cls._write_frame_feedback is patch._write_frame_feedback_310p
+
+    model = talker_cls()
+    codes = [torch.full((1, 3), 7), torch.full((1, 3), 9)]
+    model._write_frame_feedback([1, 3], codes, torch.device("cpu"))
+    assert model.frame_feedback_active.tolist() == [False, True, False, True]
+    assert model._feedback_positions is not None
+    assert model.frame_feedback_codes[1].tolist() == [7, 7, 7]
+    assert model.frame_feedback_codes[3].tolist() == [9, 9, 9]
+
+    # Empty step: flags reset and positions cleared.
+    model._write_frame_feedback([], [], torch.device("cpu"))
+    assert not model.frame_feedback_active.any()
+    assert model._feedback_positions is None

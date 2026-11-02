@@ -200,6 +200,46 @@ def _embed_embedding_310p(self, layer: nn.Module, input_: Tensor) -> Tensor:
     return out.to(input_.device)
 
 
+def _write_frame_feedback_310p(
+    self,
+    feedback_rows: list[int],
+    feedback_codes: list[Tensor],
+    device: torch.device,
+) -> None:
+    """310P twin of ``_write_frame_feedback``.
+
+    310P has no working inplace index_fill kernel: ``aclnnInplaceIndexFill``
+    faults with ACLNN error 161002, so the frame-feedback flag slab is
+    filled on the host and copied back in one small H2D transfer per step.
+    Everything else is verbatim from upstream.
+    """
+    if self._feedback_stage is None:
+        self._feedback_stage = _talker_module.PinnedIndexStage(1, self._max_rows, device)
+
+    active = self.frame_feedback_active
+    if not feedback_rows:
+        self._feedback_positions = None
+        self._feedback_codes = None
+        active.zero_()
+        return
+
+    codes = torch.cat(feedback_codes, dim=0).to(device)
+    if max(feedback_rows) < self._max_rows:
+        positions = self._feedback_stage.push([feedback_rows], len(feedback_rows))[0]
+        self.frame_feedback_codes.index_copy_(0, positions, codes)
+        active.zero_()
+        filled = torch.zeros(active.shape, dtype=active.dtype)
+        filled[positions.to("cpu", copy=False)] = True
+        active.copy_(filled)
+    else:
+        # Too wide for the slab. Nothing reads it on this step, but a stale
+        # flag would corrupt the next graph replay if the batch shrank.
+        positions = torch.tensor(feedback_rows, dtype=torch.long, device=device)
+        active.zero_()
+    self._feedback_positions = positions
+    self._feedback_codes = codes
+
+
 _TALKER_ARCH_NAME = "MiniMaxMusic3TalkerForConditionalGeneration"
 
 
@@ -208,8 +248,9 @@ def _offload_talker_embeddings_310p(worker) -> None:
 
     They are 2 x 1.64 GB of fp16 (vocab 200000 x 4096, untied); keeping
     them on the NPU would leave no room for the KV pool on the 21 GB chip.
-    Per-step traffic is the lm_head logits (already host-side for the
-    sampler seams) plus a batch x 4096 embedding move both ways.
+    Per-step traffic is the lm_head logits (computed on the host, then
+    round-tripped to the NPU for the talker's sample arithmetic) plus a
+    batch x 4096 embedding move in each direction.
     """
     if _kill_switch_off():
         return
@@ -292,6 +333,9 @@ def apply_talker_patches() -> None:
         original = getattr(_talker_module, name)
         setattr(_talker_module, name, _cpu_faithful(getattr(_sampling_module, name)))
     _rvq_decoder_module.DepthDecoderBlock.forward = _depth_decoder_block_forward_310p
+    _talker_module.MiniMaxMusic3TalkerForConditionalGeneration._write_frame_feedback = (
+        _write_frame_feedback_310p
+    )
 
     # The 310P embedding method keeps BOTH the fp16 weight and a fractal-NZ
     # copy (``layer.weight_nz = maybe_trans_nz(layer.weight)``), unlike the
