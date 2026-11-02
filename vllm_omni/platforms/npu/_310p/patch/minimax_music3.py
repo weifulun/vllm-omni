@@ -32,6 +32,12 @@ verified or inferred from the fleet's operator-gap catalog (012):
 The DiT's initial-noise draw uses a device ``torch.Generator``; if the NPU
 randn-with-generator path faults (no fleet precedent), the draw latches to
 the host with the same seed and the same ``philox`` value stream.
+* The 310P embedding method keeps a second, fractal-NZ copy of every
+  embedding weight (``layer.weight_nz``) while the Linear path converts in
+  place. The talker's untied embed_tokens and lm_head (vocab 200000)
+  would therefore pin ~3.3 GB of permanent duplicates that the 21 GB chip
+  cannot absorb on top of the 17.17 GB of weights, so the seam drops the
+  NZ copy and runs ``F.linear`` on the plain fp16 weight.
 
 Everything here is installed only when the platform already confirmed
 ``is_310p()`` and the model architecture is one of the MiniMax Music 3
@@ -159,6 +165,16 @@ def _depth_decoder_block_forward_310p(self: _rvq_decoder_module.DepthDecoderBloc
     return x + h
 
 
+def _embed_process_weights_noop_310p(self, layer: nn.Module) -> None:
+    """Skip the fractal-NZ copy; the plain fp16 weight stays loaded."""
+    return None
+
+
+def _embed_apply_plain_310p(self, layer: nn.Module, x: Tensor, bias: Tensor | None = None) -> Tensor:
+    """F.linear on the plain fp16 weight (generic NPU kernel)."""
+    return F.linear(x, layer.weight, bias)
+
+
 def apply_talker_patches() -> None:
     """Install the MiniMax Music 3 stage-0 310P patches.
 
@@ -187,10 +203,31 @@ def apply_talker_patches() -> None:
         setattr(_talker_module, name, _cpu_faithful(getattr(_sampling_module, name)))
     _rvq_decoder_module.DepthDecoderBlock.forward = _depth_decoder_block_forward_310p
 
+    # The 310P embedding method keeps BOTH the fp16 weight and a fractal-NZ
+    # copy (``layer.weight_nz = maybe_trans_nz(layer.weight)``), unlike the
+    # Linear path whose NZ conversion is in-place. On this 21 GB chip the
+    # talker's 17.17 GB of weights plus the two permanent ~1.64 GB NZ copies
+    # of embed_tokens and lm_head (untied, vocab 200000) leave no room for
+    # the KV pool, so the embedding/LM-head matmuls run on the plain fp16
+    # weight via the generic NPU kernel: numerically identical, a few
+    # gigaflops per step at most.
+    try:
+        from vllm_ascend._310p.ops import vocab_parallel_embedding as _vpe310
+    except ImportError:
+        _vpe310 = None
+    if _vpe310 is not None:
+        _method_cls = _vpe310.AscendUnquantizedEmbeddingMethod310
+        _method_cls.process_weights_after_loading = _embed_process_weights_noop_310p
+        _method_cls.apply = _embed_apply_plain_310p
+        logger.info(
+            "MiniMax Music 3 310P: embedding/LM-head fractal-NZ copies disabled "
+            "(plain-fp16 F.linear seam); linear NZ conversion left in place"
+        )
+
     _TALKER_PATCHED = True
     logger.info(
         "MiniMax Music 3 310P talker patches installed: sampler seams on %s, "
-        "depth-decoder attention decomposed",
+        "depth-decoder attention decomposed, embedding NZ seam",
         ", ".join(("apply_c0_cfg", "apply_depth_cfg", "draw_from_gumbel", "gumbel_noise", "sample_topk_seeded")),
     )
 

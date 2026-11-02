@@ -572,3 +572,43 @@ def test_ipc_routes_npu_storages_to_shm():
     assert unpicklable(_FakeTensor("npu"))
     assert not unpicklable(_FakeTensor("cpu"))
     assert not unpicklable(_FakeTensor("cuda"))
+
+
+def test_talker_embedding_nz_seam(monkeypatch):
+    """The 310P embedding method must not keep a fractal-NZ duplicate.
+
+    The talker's untied embed_tokens and lm_head (vocab 200000) would pin
+    ~3.3 GB of permanent NZ copies on the 21 GB chip, so the seam skips
+    the copy and applies F.linear on the plain fp16 weight.
+    """
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+
+    class _Method:
+        def process_weights_after_loading(self, layer):
+            layer.weight_nz = layer.weight.flip(0).clone()  # stand-in NZ copy
+
+        def apply(self, layer, x, bias=None):
+            return F.linear(x, layer.weight_nz, bias)
+
+    ascend = _install_fake_module(monkeypatch, "vllm_ascend")
+    p310 = _install_fake_module(monkeypatch, "vllm_ascend._310p")
+    ops = _install_fake_module(monkeypatch, "vllm_ascend._310p.ops")
+    vpe = _install_fake_module(
+        monkeypatch,
+        "vllm_ascend._310p.ops.vocab_parallel_embedding",
+        AscendUnquantizedEmbeddingMethod310=_Method,
+    )
+    ascend._310p = p310
+    p310.ops = ops
+    ops.vocab_parallel_embedding = vpe
+
+    patch.apply_talker_patches()
+
+    cls = vpe.AscendUnquantizedEmbeddingMethod310
+    inst = cls()
+    layer = nn.Linear(4, 8)
+    inst.process_weights_after_loading(layer)
+    assert not hasattr(layer, "weight_nz"), "the NZ copy must not be created"
+    x = torch.randn(2, 4)
+    assert torch.equal(inst.apply(layer, x), F.linear(x, layer.weight))
