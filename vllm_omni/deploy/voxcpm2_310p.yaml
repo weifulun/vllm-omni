@@ -1,0 +1,14 @@
+# VoxCPM2 310P (Atlas 300I Duo / Ascend 310P) deployment overlay.
+#
+# The 310P line is an FP16 line: the base config ships bfloat16 (correct for
+# 910B / H-series). On 310P the AR side must load FP16; the tts side-path
+# (LocDiT / AudioVAE / projections) is forced to FP16 by the model patch
+# (vllm_omni/platforms/npu/_310p/patch/voxcpm2.py) regardless.
+#
+# On the v0.32.0 line the NPU AR worker always selects the MRV1 runner, so no
+# runner selection is overridden here.
+#
+# Usage on the 310P card:
+#   vllm serve <VoxCPM2 model dir> --deploy-config vllm_omni/deploy/voxcpm2_310p.yaml
+base_config: voxcpm2.yaml
+dtype: float16
