@@ -26,7 +26,7 @@ stages:
   - stage_id: 0
     tensor_parallel_size: 2
     devices: "0,1"
-    gpu_memory_utilization: 0.68
+    gpu_memory_utilization: 0.72
     max_model_len: 8192
     # Real-device first boot (128 C1, 2026-11-02): the base PIECEWISE
     # compiled decode fails on 310P — aclnnApplyRotaryPosEmbV2 gets a null
@@ -34,8 +34,28 @@ stages:
     # (AclNN_Parameter_Error EZ1001 "Check cos != nullptr"). Documented
     # TODO(310P-real) fallback: enforce_eager for this stage.
     enforce_eager: true
+    # Real-device (128 C2, 2026-11-02) measurement-driven bump: profile peak
+    # (weights 10.4 + encoders 1.4 + LLM-dummy activations ~1.6) leaves only
+    # ~1.8 GiB for KV at mmu 0.68 before the 310P worker halves it for
+    # workspace (0.48 GiB < 0.57 GiB needed for 8192 tokens) -> 0.72.
+    # Real-device (128 C2, 2026-11-02): the v1 profile_run dummy-multimodal
+    # pass (2 max-feature-size video items + image + audio) peaks ~6 GiB of
+    # encoder activations on top of the 11.8 GiB of TP2 weights + replicated
+    # SigLIP/Whisper encoders — beyond the 21.08 GiB chip budget before any
+    # KV is allocated. Skip the multimodal profiling pass: KV sizing then
+    # measures the LLM-only peak (correct for AR budgeting); runtime encoder
+    # activations draw on the KV headroom (residual risk for very large
+    # videos documented in the task report; INT8 tier is the escalation path).
+    skip_mm_profiling: true
   - stage_id: 1
     devices: "0"
+    # Real-device (128 C2, 2026-11-02): stage 1 boots with the base
+    # FULL_DECODE_ONLY cudagraph capture; on 310P the talker's decode step
+    # runs through the 310P rope torch-fallback (cos-slice None for the
+    # MiniCPM-o configs), which is not torch._dynamo fullgraph-capture-safe
+    # -> ACL capture crashes engine init. Documented fallback: eager decode
+    # (ngram K speculation stays on; it is orthogonal to graphs).
+    enforce_eager: true
   - stage_id: 2
     devices: "1"
 
@@ -43,7 +63,7 @@ platforms:
   npu:
     stages:
       - stage_id: 0
-        gpu_memory_utilization: 0.68
+        gpu_memory_utilization: 0.72
         additional_config:
           encoder_enable_npu_graph: false
       - stage_id: 1
