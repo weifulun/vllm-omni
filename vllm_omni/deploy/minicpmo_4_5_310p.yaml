@@ -27,7 +27,12 @@ stages:
     tensor_parallel_size: 2
     devices: "0,1"
     gpu_memory_utilization: 0.78
-    max_model_len: 4096
+    max_model_len: 8192
+    # Real-device (128 C1, 2026-11-03): shrink the profile dummy batch to cap the
+    # retained caching-allocator blocks under the EH0012 no-op (aee740b99):
+    # peak = base + dummy activations + retained cache, and the margin is what
+    # funds the 8192-token KV check (0.57 GiB engine-side).
+    max_num_batched_tokens: 4096
     # Real-device first boot (128 C1, 2026-11-02): the base PIECEWISE
     # compiled decode fails on 310P — aclnnApplyRotaryPosEmbV2 gets a null
     # cos tensor under the torch.compile/AOTAutograd partition
@@ -63,7 +68,7 @@ platforms:
   npu:
     stages:
       - stage_id: 0
-        gpu_memory_utilization: 0.72
+        gpu_memory_utilization: 0.78
         additional_config:
           encoder_enable_npu_graph: false
       - stage_id: 1
