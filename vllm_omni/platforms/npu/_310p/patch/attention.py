@@ -50,15 +50,29 @@ def _math_sdpa(
 
     if scale is None:
         scale = 1.0 / query.shape[-1] ** 0.5
-    attn = torch.matmul(query * scale, key.transpose(-2, -1))
-    if causal:
-        seq = attn.shape[-1]
-        causal_mask = torch.ones(seq, seq, dtype=torch.bool, device=attn.device).tril()
-        attn = attn.masked_fill(~causal_mask, float("-inf"))
-    if attention_mask is not None:
-        attn = attn + attention_mask
-    attn = torch.softmax(attn, dim=-1)
-    return torch.matmul(attn, value)
+
+    batch, heads, seq, _dim = query.shape
+    out = torch.empty_like(query)
+    # Head chunking: the math decomposition materialises the full [B, Hc, S, S]
+    # score matrix per chunk.  At DiT resolutions (S=4096, H=30, fp16) the
+    # un-chunked matrix is ~10GiB and OOMs the 21.08GiB single chip together
+    # with the weights; keep each chunk under a fixed byte budget.
+    bytes_per_head = batch * seq * seq * max(1, query.element_size())
+    target_bytes = int(os.environ.get("VLLM_OMNI_310P_ATTN_HEAD_CHUNK_BYTES", str(256 * 1024 * 1024)))
+    head_chunk = max(1, min(heads, target_bytes // max(1, bytes_per_head)))
+    mask_slices = attention_mask is not None and attention_mask.dim() >= 2 and attention_mask.shape[1] == heads
+    for h0 in range(0, heads, head_chunk):
+        h1 = min(h0 + head_chunk, heads)
+        q = query[:, h0 : h1] * scale
+        attn = torch.matmul(q, key[:, h0:h1].transpose(-2, -1))
+        if causal:
+            causal_mask = torch.ones(seq, seq, dtype=torch.bool, device=attn.device).tril()
+            attn = attn.masked_fill(~causal_mask, float("-inf"))
+        if attention_mask is not None:
+            attn = attn + (attention_mask[:, h0:h1] if mask_slices else attention_mask)
+        attn = torch.softmax(attn, dim=-1)
+        out[:, h0:h1] = torch.matmul(attn, value[:, h0:h1])
+    return out
 
 
 def _patch_f_sdpa() -> None:

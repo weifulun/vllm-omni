@@ -75,17 +75,35 @@ class _ZImage310P(ZImagePipeline):
     """
 
     def __init__(self, *, od_config, prefix: str = "") -> None:
-        super().__init__(od_config=od_config, prefix=prefix)
-        self._encoder_device = self.device
+        # 310P hardware constraint: aclnn has no BF16 support for elementwise
+        # initializers (aclnnInplaceOne fails with "Tensor self not implemented
+        # for DT_BFLOAT16").  Component construction under the engine's default
+        # (BF16) dtype leaks NPU-current-device parameter inits (e.g. Qwen3
+        # RMSNorm ``torch.ones``) onto the chip; pin the FP16 runtime dtype and
+        # the CPU default device around construction (modules are .to() their
+        # final devices afterwards, so construction on CPU is exact).
+        _prev_dtype = torch.get_default_dtype()
+        _had_default_device = hasattr(torch.device, "get_default")
+        _prev_device = torch.device.get_default() if _had_default_device else None
+        try:
+            torch.set_default_dtype(_RUNTIME_DTYPE)
+            if _had_default_device:
+                torch.device.set_default(_CPU_DEVICE)
+            super().__init__(od_config=od_config, prefix=prefix)
+        finally:
+            torch.set_default_dtype(_prev_dtype)
+            if _had_default_device and _prev_device is not None:
+                torch.device.set_default(_prev_device)
+        self._encoder_device = self._execution_device
         if not _encoder_on_npu():
             self._encoder_device = _CPU_DEVICE
             self.text_encoder.to(device=_CPU_DEVICE, dtype=torch.float32)
             logger.info(
                 "[310P] Z-Image text encoder pinned to CPU (FP32); embeds moved to %s in %s.",
-                self.device,
+                self._execution_device,
                 _RUNTIME_DTYPE,
             )
-        maybe_install_phase_tracer(self, self.device)
+        maybe_install_phase_tracer(self, self._execution_device)
 
     def _encode_prompt(
         self,
