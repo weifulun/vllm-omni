@@ -91,7 +91,7 @@ def _log(msg: str) -> None:
 def _math_sdpa_single(
     q: torch.Tensor, k: torch.Tensor, v: torch.Tensor, attn_mask: torch.Tensor | None, scale: float
 ) -> torch.Tensor:
-    scores = torch.matmul(q.float(), k.transpose(-2, -1))
+    scores = torch.matmul(q.float(), k.float().transpose(-2, -1))
     scores = scores * scale
     if attn_mask is not None:
         scores = scores + attn_mask.float()
@@ -160,8 +160,9 @@ def apply_stage0_patches(model_config) -> None:
     if hf_config is None:
         return
     encoder_config = getattr(hf_config, "encoder_config", None)
-    if encoder_config is not None:
-        encoder_config._attn_implementation = "eager"
+    if encoder_config is None:
+        return  # nothing to pin; leave the flag unset
+    encoder_config._attn_implementation = "eager"
     _STAGE0_PATCHED = True
     _log("stage0: whisper encoder _attn_implementation -> eager")
 
