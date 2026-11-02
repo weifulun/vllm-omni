@@ -26,7 +26,7 @@ stages:
   - stage_id: 0
     tensor_parallel_size: 2
     devices: "0,1"
-    gpu_memory_utilization: 0.78
+    gpu_memory_utilization: 0.75
     max_model_len: 8192
     # Real-device (128 C1, 2026-11-03): shrink the profile dummy batch to cap the
     # retained caching-allocator blocks under the EH0012 no-op (aee740b99):
@@ -68,7 +68,7 @@ platforms:
   npu:
     stages:
       - stage_id: 0
-        gpu_memory_utilization: 0.78
+        gpu_memory_utilization: 0.75
         additional_config:
           encoder_enable_npu_graph: false
       - stage_id: 1
