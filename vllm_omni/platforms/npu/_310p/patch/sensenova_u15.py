@@ -80,6 +80,17 @@ Component placement (logged at startup):
      ~1.1 GiB resident).  Breaks it2i if used.
   2. ``VLLM_OMNI_310P_SENSENOVA_VISION_CPU=1`` - pin the understanding
      side ViT to host memory (img2text pays one H2D per request).
+  3. Single-chip memory tier when resident fp16 weights exceed the
+     ~21.6 GiB budget AND INT8 is unavailable: launch with the framework's
+     ``--enable-layerwise-offload``.  The pipeline declares
+     ``_dit_modules = ["language_model"]`` (the MoT LM streams block-by-
+     block from host to the chip; ViT/fm_modules stay resident), so only
+     one LM block plus the resident encoders occupy device memory.  INT8
+     itself is infeasible on this 310P build: ``npu_quant_matmul``
+     (aclnnQuantMatmulV5) rejects the INT8 W8A8 recipe (per-token
+     activation scale unsupported on inference-series cards; even the
+     minimal no-pertoken form fails ACLNN_ERR_PARAM_INVALID 161002 -
+     task-17 report, section 量化配置).
 """
 
 from __future__ import annotations
@@ -109,6 +120,7 @@ _NUMERICAL_CACHE_BACKENDS = frozenset(
 #: OOM downgrade chain env vars (see module docstring).
 _VISION_CPU_ENV = "VLLM_OMNI_310P_SENSENOVA_VISION_CPU"
 _MOTGEN_CPU_ENV = "VLLM_OMNI_310P_SENSENOVA_MOTGEN_CPU"
+_LM_CPU_ENV = "VLLM_OMNI_310P_SENSENOVA_LM_CPU"
 
 _APPLIED = False
 _LOADER_CPU_BUILD_INSTALLED = False
@@ -189,29 +201,55 @@ def _quantization_method(quant_config: Any) -> str | None:
     return None
 
 
+def _offload_active(od_config: Any) -> bool:
+    """True when the framework's diffusion CPU offload owns weight residency.
+
+    With ``--enable-layerwise-offload`` the loader loads to host and the
+    offload backend streams the declared dit component (here:
+    ``language_model``) block-by-block, so the single-chip FP16 residency
+    budget no longer applies to the LM weights.
+    """
+    try:
+        from vllm_omni.diffusion.offloader.config import offload_enabled
+    except Exception:  # pragma: no cover - import guard
+        return False
+    try:
+        return bool(offload_enabled(od_config))
+    except Exception:  # pragma: no cover - defensive
+        return False
+
+
 def _validate_quantization(od_config: Any) -> None:
     """Precision-tier gate for SenseNova-U1.5 on 310P (POLICY section 2).
 
     FP16 is the primary tier in general, but for THIS model the FP16
-    weights (35.07 GB) exceed the 21589 MB single-chip budget, so the
-    sanctioned primary tier is INT8 W8A8 (research/009: online dynamic
-    INT8 via npu_quant_matmul; layers wider than 65535 fall back to
-    unquantized).  Single-chip FP16 (no quant config) is rejected at patch
-    time rather than dying mid-load with an allocator OOM.
+    weights (35.07 GB) exceed the 21589 MB single-chip budget.  Two
+    sanctioned single-chip paths exist: INT8 W8A8 (research/009: online
+    dynamic INT8 via npu_quant_matmul; layers wider than 65535 fall back
+    to unquantized) or FP16 under the framework's layerwise offload
+    (``--enable-layerwise-offload``: the MoT LM streams from host).  NOTE:
+    on the 127 C4 310P (CANN 9.1.0) the INT8 op turned out to be infeasible
+    (npu_quant_matmul / aclnnQuantMatmulV5 rejects the W8A8 recipe with
+    ACLNN_ERR_PARAM_INVALID 161002 - task-17 report, section 量化配置), so
+    offload is the operative single-chip tier there.  Single-chip FP16
+    (no quant config, no offload) is rejected at patch time rather than
+    dying mid-load with an allocator OOM.
     """
     quant_config = getattr(od_config, "quantization_config", None)
     if quant_config is None:
         parallel = getattr(od_config, "parallel_config", None)
         tp = getattr(parallel, "tensor_parallel_size", 1) if parallel is not None else 1
         sp = getattr(parallel, "sequence_parallel_size", 1) if parallel is not None else 1
-        if tp * max(sp or 1, 1) <= 1:
+        if tp * max(sp or 1, 1) <= 1 and not _offload_active(od_config):
             raise RuntimeError(
-                "SenseNova-U1.5-8B-MoT on 310P single chip cannot run the FP16 tier: "
-                "the checkpoint is 17.53B params / 35.07 GB (bf16 shards), above the "
-                "21589 MB chip budget before activations.  POLICY section 2 mandates "
-                "the INT8 W8A8 fallback tier here: set quantization_config "
-                "method='int8' (DiffusionInt8Config, online dynamic quantization). "
-                "A two-chip FP16 split is out of scope for this task (TP1-only GO)."
+                "SenseNova-U1.5-8B-MoT on 310P single chip cannot run the plain FP16 "
+                "tier: the checkpoint is 17.53B params / 35.07 GB (bf16 shards), above "
+                "the 21589 MB chip budget before activations.  Use either "
+                "quantization_config method='int8' (DiffusionInt8Config, online dynamic "
+                "quantization) or the framework's --enable-layerwise-offload (FP16 "
+                "weights stream from host; required on 127 C4 where the INT8 op is "
+                "infeasible - see report).  A two-chip FP16 split is out of scope "
+                "for this task (TP1-only GO)."
             )
         return
     method = _quantization_method(quant_config)
@@ -380,17 +418,22 @@ def _install_loader_cpu_build() -> None:
 
 
 def _install_vision_cpu_pin() -> None:
-    """Env-gated OOM downgrade: pin the NEOVision modules to host memory.
+    """Env-gated OOM downgrade: pin NEOVision modules and/or the MoT LM to
+    host memory.
 
     Runs AFTER the loader's post-loading placement (which lands everything
     on the chip), so the pin is a post-hoc D2H move of already-loaded
-    weights.  Default off: both ViTs stay on-chip, matching the generic
-    310P path (COMPARISON-POLICY.md section 1 level 2 parity).
+    weights.  Default off: both ViTs and the LM stay on-chip, matching the
+    generic 310P path (COMPARISON-POLICY.md section 1 level 2 parity).
     """
     global _VISION_PIN_INSTALLED
     if _VISION_PIN_INSTALLED:
         return
-    if os.environ.get(_VISION_CPU_ENV, "0") != "1" and os.environ.get(_MOTGEN_CPU_ENV, "0") != "1":
+    if (
+        os.environ.get(_VISION_CPU_ENV, "0") != "1"
+        and os.environ.get(_MOTGEN_CPU_ENV, "0") != "1"
+        and os.environ.get(_LM_CPU_ENV, "0") != "1"
+    ):
         return
 
     loader_mod = importlib.import_module("vllm_omni.diffusion.model_loader.diffusers_loader")
@@ -398,7 +441,7 @@ def _install_vision_cpu_pin() -> None:
     if loader_cls is None:
         logger.warning(
             "[310P][sensenova-u1.5] %s requested but DiffusersPipelineLoader not found; pin skipped.",
-            (_VISION_CPU_ENV, _MOTGEN_CPU_ENV),
+            (_VISION_CPU_ENV, _MOTGEN_CPU_ENV, _LM_CPU_ENV),
         )
         return
 
@@ -419,6 +462,14 @@ def _install_vision_cpu_pin() -> None:
                 "[310P][sensenova-u1.5] vision_model pinned to CPU via %s "
                 "(img2text pays one H2D transfer per request).",
                 _VISION_CPU_ENV,
+            )
+        if os.environ.get(_LM_CPU_ENV, "0") == "1" and getattr(model, "language_model", None) is not None:
+            model.language_model = model.language_model.to("cpu")
+            logger.warning(
+                "[310P][sensenova-u1.5] language_model pinned to CPU via %s "
+                "(MoT LM resident fp16 exceeds the single-chip budget; "
+                "denoising and AR decode run at CPU speed).",
+                _LM_CPU_ENV,
             )
 
     loader_cls._process_weights_after_loading = _post_load_with_pin  # type: ignore[method-assign]

@@ -105,6 +105,7 @@ class _FakeVision:
     def __init__(self):
         self.vision_model = _FakeModule()
         self.fm_modules = {"vision_model_mot_gen": _FakeModule()}
+        self.language_model = _FakeModule()
 
 
 class _FakeInt8Layer:
@@ -159,6 +160,15 @@ def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
             self.backend = backend
 
     _install_fake_module(monkeypatch, "vllm_omni.diffusion.data", AttentionSpec=FakeAttentionSpec)
+
+    def _fake_offload_enabled(config):
+        return bool(
+            getattr(config, "enable_layerwise_offload", False)
+            or getattr(config, "enable_cpu_offload", False)
+            or getattr(config, "enable_distributed_layerwise_offload", False)
+        )
+
+    _install_fake_module(monkeypatch, "vllm_omni.diffusion.offloader.config", offload_enabled=_fake_offload_enabled)
 
     members = {
         name: SimpleNamespace(get_path=lambda n=name: f"vllm_omni.diffusion.attention.backends.{n.lower()}.Backend")
@@ -408,6 +418,21 @@ def test_single_chip_fp16_without_quant_is_rejected(monkeypatch: pytest.MonkeyPa
         module.apply_diffusion_310p_patches(_make_od_config(tp=1, sp=None))
 
 
+def test_single_chip_fp16_with_layerwise_offload_is_accepted(monkeypatch: pytest.MonkeyPatch):
+    """127 C4 reality: the INT8 op (npu_quant_matmul / aclnnQuantMatmulV5)
+    rejects the W8A8 recipe on 310P CANN 9.1.0 (task-17, 量化配置 section),
+    so the operative single-chip FP16 tier streams the MoT LM from host via
+    the framework's --enable-layerwise-offload.  The residency guard must
+    accept that path instead of failing at patch time."""
+    _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+
+    od_config = _make_od_config(tp=1, sp=None)
+    od_config.enable_layerwise_offload = True
+    module.apply_diffusion_310p_patches(od_config)
+    assert module._APPLIED is True
+
+
 def test_multi_chip_without_quant_is_not_patched_rejected(monkeypatch: pytest.MonkeyPatch):
     """A 2-chip FP16 split is a separate validation scope (TP1-only GO); the
     patch must not hard-fail it, only the quant tiers are gated."""
@@ -566,6 +591,42 @@ def test_vision_pins_absent_by_default(monkeypatch: pytest.MonkeyPatch):
     loader_cls._process_weights_after_loading(object(), model, "npu:0")
     assert len(captured["post_load_calls"]) == 1
     assert model.vision_model.device == "npu:0"
+
+
+def test_lm_cpu_pin_moves_language_model_to_cpu(monkeypatch: pytest.MonkeyPatch):
+    """Single-chip 310P memory-last-resort tier: resident fp16 MoT LM (17.5B,
+    ~35 GB) exceeds the ~21.6 GiB chip budget and the INT8 W8A8 recipe is
+    rejected by the 310P npu_quant_matmul kernel (task-17, 量化配置 section),
+    so the LM must be pinnable to host memory post-load."""
+    monkeypatch.setenv("VLLM_OMNI_310P_SENSENOVA_LM_CPU", "1")
+    monkeypatch.delenv("VLLM_OMNI_310P_SENSENOVA_VISION_CPU", raising=False)
+    monkeypatch.delenv("VLLM_OMNI_310P_SENSENOVA_MOTGEN_CPU", raising=False)
+    captured = _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+
+    module.apply_diffusion_310p_patches(_make_od_config(quantization_config=_int8_config()))
+
+    loader_cls = captured["loader_module"].DiffusersPipelineLoader
+    model = _FakeVision()
+    loader_cls._process_weights_after_loading(object(), model, "npu:0")
+
+    assert model.language_model.device == "cpu"
+    # Only the LM is pinned in this mode; the ViTs stay on-chip.
+    assert model.vision_model.device == "npu:0"
+    assert model.fm_modules["vision_model_mot_gen"].device == "npu:0"
+
+
+def test_lm_cpu_pin_absent_by_default(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.delenv("VLLM_OMNI_310P_SENSENOVA_LM_CPU", raising=False)
+    captured = _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+
+    module.apply_diffusion_310p_patches(_make_od_config(quantization_config=_int8_config()))
+
+    loader_cls = captured["loader_module"].DiffusersPipelineLoader
+    model = _FakeVision()
+    loader_cls._process_weights_after_loading(object(), model, "npu:0")
+    assert model.language_model.device == "npu:0"
 
 
 def test_platform_guard_forces_sdpa_and_blocks_mindiesd(monkeypatch: pytest.MonkeyPatch):
