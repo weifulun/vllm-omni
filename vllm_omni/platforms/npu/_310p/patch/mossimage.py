@@ -41,6 +41,10 @@ transformer, conv2d VAE instead of the conv3d family):
    ``from_pretrained_with_prefetch`` reference so the encoder factory runs
    under ``torch.device("cpu")`` and the returned model is CPU-pinned
    (``_make_cpu_pinned`` redirects every later ``.to(...)`` to CPU).
+   The same pin wraps the instance ``forward`` as well: the model's custom
+   pipeline moves tokenizer output to ``_execution_device`` (NPU) before the
+   encoder call, which crashes ``embed_tokens`` on the npu:0/cpu split with
+   a CPU-pinned encoder (machine-verified, first run 2026-11-02).
 
 5. Explicit post-load placement: after ``MOSSImagePipeline.load_weights``
    finishes, ``_install_post_load_placement`` moves the transformer (built on
@@ -57,6 +61,27 @@ transformer, conv2d VAE instead of the conv3d family):
    >65535 weight values fall back to FP16 layer-wise; research/009) and is
    accepted with a loud warning; BF16 and all other quantization methods are
    rejected.
+
+8. Prompt-embedding device handoff: the engine's stepwise path
+   (``prepare_encode``) consumes ``encode_prompt`` output verbatim; with a
+   CPU-pinned encoder (invariant 4) the padded embeddings + mask stay on CPU
+   and the transformer's first text projection dies on the npu:0/cpu split
+   (machine-verified first-run crash: ``mat1 is on cpu ... wrapper_NPU__addmm``).
+   ``_patch_encode_prompt_output_device`` moves them to the transformer's
+   execution device after encoding (the model file's own ``prepare()`` does
+   the equivalent on its ``__call__`` path).
+
+9. fp64 is a hard-stop kernel family on 310P3 (CANN 9.1.0): the transformer's
+   ``_time_modulation`` computes its sinusoid in float64
+   (``10000 ** (-arange/half)`` + ``times.double()``) and diffusers
+   materializes the scheduler sigma grid as float64 on the device (fp64 Euler
+   update).  Both are the dynamic-TBE compile-gap class (research/012); on
+   this machine the failure mode is a hard SIGBUS in the TBE subprocess
+   (machine-verified, two standalone probes 2026-11-03).  The fp32
+   replacements (``_patch_time_modulation_fp32``,
+   ``_patch_scheduler_sigmas_fp32``) are numerically negligible (~1e-7
+   relative modulation delta; the sigma values are fp32-derived anyway) and
+   restore the release's documented "Euler updates use fp32" contract.
 
 ``VLLM_OMNI_310P_DIFFUSION_PATCHES=0`` disables the whole dispatch (the
 COMPARISON-POLICY.md section 1 level-2 same-seed reference hook).
@@ -411,6 +436,18 @@ def _make_cpu_pinned(model: Any) -> Any:
 
     The overlay subclasses the real class without adding storage, so the
     instance layout is unchanged and ``__class__`` swap is safe.
+
+    Also wraps the instance ``forward`` so tensor inputs are coerced onto
+    the module's own (CPU) device before dispatch: the model's custom
+    pipeline (``pipeline_moss_image.encode_prompt``) moves the tokenizer
+    output to ``self._execution_device`` (the NPU) *before* calling the
+    encoder, which is only correct when the encoder is co-located there.
+    With a CPU-pinned encoder the ``embed_tokens`` lookup would crash on
+    the npu:0/cpu device split (verified on-device, first-run crash).
+    The downstream handoff is already device-aware in the model code:
+    ``MOSSImagePipeline.__call__`` moves the returned embeddings back to
+    ``_execution_device`` before the transformer forward, so only the
+    encoder input side needs the coercion.
     """
     if getattr(model, "_310p_cpu_pinned", False):
         return model
@@ -423,6 +460,35 @@ def _make_cpu_pinned(model: Any) -> Any:
     overlay = type(f"_CPUPinned{base.__name__}", (base,), {"to": _to_cpu})
     model.__class__ = overlay
     model._310p_cpu_pinned = True
+
+    if not getattr(model, "_310p_forward_wrapped", False):
+        import types
+
+        # Bound method (self already bound); the wrapper is re-bound via
+        # MethodType so nn.Module.__call__ passes self once, and we forward
+        # the *remaining* args to the original without re-binding.
+        orig_bound = model.forward
+
+        def _forward_device_safe(self: Any, *args: Any, **kwargs: Any) -> Any:
+            del self
+            try:
+                dev = next(model.parameters()).device
+            except StopIteration:
+                dev = torch.device("cpu")
+            if dev.type == "cpu":
+                args = tuple(a.to(dev) if isinstance(a, torch.Tensor) else a for a in args)
+                kwargs = {
+                    k: (v.to(dev) if isinstance(v, torch.Tensor) else v) for k, v in kwargs.items()
+                }
+            return orig_bound(*args, **kwargs)
+
+        model.forward = types.MethodType(_forward_device_safe, model)
+        model._310p_forward_wrapped = True
+        logger.info(
+            "310P MOSS-Image: text encoder forward wrapped (tensor inputs "
+            "coerced to the encoder's CPU device; the pipeline's own "
+            "encode_prompt targets _execution_device=NPU)."
+        )
     return model
 
 
@@ -511,6 +577,139 @@ def _install_post_load_placement() -> None:
     )
 
 
+def _patch_encode_prompt_output_device() -> None:
+    """Move prompt embeddings + mask to the execution device after encoding.
+
+    The engine's stepwise path (``MOSSImagePipeline.prepare_encode``) consumes
+    ``encode_prompt`` output verbatim: with upstream placement the encoder
+    sits on the execution device, so its output is already there.  With the
+    CPU-pinned encoder (invariant 4) the padded embeddings and mask stay on
+    CPU and the transformer's first text projection dies on the npu:0/cpu
+    split (machine-verified, first run 2026-11-02: ``mat1 is on cpu, ...
+    wrapper_NPU__addmm``).  This wrap restores the device move the model
+    file's own ``prepare()`` performs on its ``__call__`` path.
+    """
+    from vllm_omni.diffusion.models.mossimage import pipeline_mossimage
+
+    cls = pipeline_mossimage.MOSSImagePipeline
+    if getattr(cls, "_310p_encode_device_patched", False):
+        return
+    original = cls.encode_prompt
+
+    def _encode_prompt_on_execution_device(self: Any, *args: Any, **kwargs: Any):
+        embeds, mask = original(self, *args, **kwargs)
+        target = None
+        transformer = getattr(self, "transformer", None)
+        if transformer is not None:
+            try:
+                target = next(transformer.parameters()).device
+            except StopIteration:
+                target = None
+        if target is None:
+            target = getattr(self, "device", None)
+        if target is not None:
+            if torch.is_tensor(embeds) and embeds.device != target:
+                embeds = embeds.to(target)
+            if torch.is_tensor(mask) and mask.device != target:
+                mask = mask.to(target)
+        return embeds, mask
+
+    cls.encode_prompt = _encode_prompt_on_execution_device
+    cls._310p_encode_device_patched = True
+    logger.info(
+        "310P MOSS-Image: MOSSImagePipeline.encode_prompt wrapped (CPU-pinned "
+        "encoder output moved to the transformer's execution device)."
+    )
+
+
+def _patch_time_modulation_fp32() -> None:
+    """Replace the transformer's fp64 sinusoid with the fp32 equivalent.
+
+    310P3 (CANN 9.1.0 / torch_npu 2.10.0.post4) cannot dynamically TBE-compile
+    the fp64 power/cos/sin kernels that
+    ``MOSSImageTransformer._time_modulation`` uses (``10000 ** (-arange/half)``
+    in float64 + ``times.double()``): this op family is the CANN 9.1.0
+    dynamic-TBE compile-gap class (research/012) and on this machine it fails
+    as a hard SIGBUS inside the TBE subprocess, not a clean error
+    (machine-verified with two standalone probes, 2026-11-03).
+
+    The fp32 rewrite is numerically negligible for this deployment: the
+    sinusoid feeds ``time_embedding`` as fp32 (``.float()``) in the original
+    code too, and fp64 -> fp32 phase arithmetic shifts the modulation by
+    ~1e-7 relative -- dwarfed by the fp16 deployment quantization.  Upstream
+    keeps fp64 for CUDA parity; 310P cannot run it at all, so this
+    replacement is 310P-gated like the rest of the module.
+    """
+    from vllm_omni.diffusion.models.mossimage import mossimage_transformer
+
+    cls = mossimage_transformer.MOSSImageTransformer
+    if getattr(cls, "_310p_time_mod_fp32", False):
+        return
+
+    def _time_modulation_fp32(self: Any, timestep: Any, batch: int, device: Any) -> Any:
+        times = torch.as_tensor(timestep, device=device, dtype=torch.float32).reshape(-1)
+        times = times.expand(batch)
+        half = self.freq_dim // 2
+        freq = 10000.0 ** (-torch.arange(half, device=device, dtype=torch.float32) / half)
+        phase = times[:, None] * freq
+        embedding = torch.cat((phase.cos(), phase.sin()), -1).float()
+        time = self.time_embedding(embedding.to(self.time_embedding[0].weight.dtype)).float()
+        mod = self.shared_block_modulation(time.to(self.shared_block_modulation.weight.dtype)).view(
+            batch, 6, -1
+        )
+        head = self.video_head_modulation(time.to(self.video_head_modulation.weight.dtype)).view(
+            batch, 2, -1
+        )
+        return mod, head
+
+    cls._time_modulation = _time_modulation_fp32
+    cls._310p_time_mod_fp32 = True
+    logger.info(
+        "310P MOSS-Image: transformer sinusoid time embedding recomputed in "
+        "fp32 (fp64 TBE kernels unsupported on 310P3; hard SIGBUS otherwise)."
+    )
+
+
+def _patch_scheduler_sigmas_fp32() -> None:
+    """Downcast the scheduler's sigma grid to fp32 on the device.
+
+    ``MOSSImageScheduler.set_timesteps`` computes the V2 nearest-grid sigma
+    sequence in fp32 on the CPU and hands it to diffusers'
+    ``FlowMatchEulerDiscreteScheduler.set_timesteps``, which materializes
+    ``self.sigmas`` as a **float64** tensor on the execution device.  The
+    Euler update (``sample + (sigma_next - sigma) * velocity``) then mixes
+    fp64 sigmas with fp32 latents on the NPU -- the same fp64 dynamic-TBE
+    family that SIGBUSes on 310P3 (research/012; machine-verified class).
+
+    The fp32 downcast also restores the release's documented precision
+    contract ("CFG and Euler latent updates use fp32"; the sigma values are
+    fp32-derived anyway -- the CPU grid is fp32 ``linspace`` round-tripped
+    through Python floats), so no precision is lost on any platform.
+    """
+    from vllm_omni.diffusion.models.mossimage import pipeline_mossimage
+
+    cls = pipeline_mossimage.MOSSImageScheduler
+    if getattr(cls, "_310p_sigmas_fp32", False):
+        return
+    original = cls.set_timesteps
+
+    def _set_timesteps_fp32_sigmas(self: Any, *args: Any, **kwargs: Any):
+        result = original(self, *args, **kwargs)
+        if torch.is_tensor(self.sigmas) and self.sigmas.dtype == torch.float64:
+            self.sigmas = self.sigmas.to(torch.float32)
+        if torch.is_tensor(self.timesteps) and self.timesteps.dtype == torch.float64:
+            self.timesteps = self.timesteps.to(torch.float32)
+        return result
+
+    cls.set_timesteps = _set_timesteps_fp32_sigmas
+    cls._310p_sigmas_fp32 = True
+    logger.info(
+        "310P MOSS-Image: MOSSImageScheduler sigma grid pinned to fp32 on the "
+        "device (diffusers default is fp64 -> fp64 Euler kernels, unsupported "
+        "on 310P3; restores the release fp32-update contract)."
+    )
+
+
 def _log_placement_plan(od_config: Any) -> None:
     tp = int(getattr(od_config, "tensor_parallel_size", 1) or 1)
     logger.info(
@@ -566,6 +765,9 @@ def apply_diffusion_310p_patches(od_config: Any) -> None:
 
     _patch_pipeline_encoder_placement(pipeline_module)
     _install_post_load_placement()
+    _patch_encode_prompt_output_device()
+    _patch_time_modulation_fp32()
+    _patch_scheduler_sigmas_fp32()
     _log_placement_plan(od_config)
     _APPLIED = True
 

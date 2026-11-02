@@ -122,13 +122,63 @@ def _load_mossimage_patch(monkeypatch: pytest.MonkeyPatch, is_310p_value: bool =
         def load_weights(self, weights):
             return "loaded"
 
+        def encode_prompt(self, prompt, max_sequence_length=512):
+            # CPU outputs: mirrors the CPU-pinned encoder (invariant 4) --
+            # the 310P wrap under test must move these to the execution device.
+            return torch.zeros(1, 8, 4), torch.ones(1, 8, dtype=torch.bool)
+
+    class _FakeMOSSImageScheduler:
+        """Mimics diffusers: materializes sigmas/timesteps as float64 tensors
+        on the execution device (the fp64 grid the 310P wrap must downcast)."""
+
+        def set_timesteps(self, num_inference_steps=50, device=None, shift=None):
+            dev = device if device is not None else torch.device("cpu")
+            self.sigmas = torch.tensor([1.0, 0.5, 0.0], dtype=torch.float64, device=dev)
+            self.timesteps = torch.tensor([999.0, 499.0], dtype=torch.float64, device=dev)
+            return None
+
+    class _FakeMOSSImageTransformer:
+        freq_dim = 8
+
+        def _time_modulation(self, timestep, batch, device):
+            # Faithful replica of the upstream fp64 body (what the 310P wrap
+            # must replace -- float64 arange + times.double()).
+            times = torch.as_tensor(timestep, device=device, dtype=torch.float32).reshape(-1)
+            times = times.expand(batch)
+            half = self.freq_dim // 2
+            freq = 10000 ** (-torch.arange(half, device=device, dtype=torch.float64) / half)
+            phase = times.double()[:, None] * freq
+            embedding = torch.cat((phase.cos(), phase.sin()), -1).float()
+            time = self.time_embedding(embedding.to(self.time_embedding[0].weight.dtype)).float()
+            mod = self.shared_block_modulation(
+                time.to(self.shared_block_modulation.weight.dtype)
+            ).view(batch, 6, -1)
+            head = self.video_head_modulation(
+                time.to(self.video_head_modulation.weight.dtype)
+            ).view(batch, 2, -1)
+            return mod, head
+
     pipeline_mod.from_pretrained_with_prefetch = _fpwp_passthrough
     pipeline_mod.AutoModel = _FakeAutoModel
     pipeline_mod.AutoTokenizer = _FakeTokenizer
     pipeline_mod.MOSSImagePipeline = _FakeMOSSImagePipeline
+    pipeline_mod.MOSSImageScheduler = _FakeMOSSImageScheduler
     monkeypatch.setitem(
         sys.modules, "vllm_omni.diffusion.models.mossimage",
         types.ModuleType("vllm_omni_fake_mossimage_pkg"),
+    )
+    # Fake transformer module (the _time_modulation fp32-replacement target);
+    # registered after the fake package above so the attribute binds.
+    transformer_mod = types.ModuleType("vllm_omni_fake_mossimage_transformer")
+    transformer_mod.MOSSImageTransformer = _FakeMOSSImageTransformer
+    monkeypatch.setitem(
+        sys.modules, "vllm_omni.diffusion.models.mossimage.mossimage_transformer",
+        transformer_mod,
+    )
+    setattr(
+        sys.modules["vllm_omni.diffusion.models.mossimage"],
+        "mossimage_transformer",
+        transformer_mod,
     )
     monkeypatch.setitem(
         sys.modules,
@@ -547,6 +597,50 @@ def test_pipeline_encoder_placement_pins_auto_model(monkeypatch: pytest.MonkeyPa
     assert tokenizer == "tokenizer"
 
 
+def test_cpu_pinned_encoder_forward_coerces_input_device(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """pipeline_moss_image.encode_prompt moves tokenizer output to
+    ``_execution_device`` (NPU) before the encoder call; a CPU-pinned encoder
+    must still see its inputs on the encoder's own device (verified on-device
+    as the first-run ``embed_tokens`` npu:0/cpu crash)."""
+    module, _, _, _ = _load_mossimage_patch(monkeypatch)
+    module._APPLIED = False
+
+    seen: dict[str, Any] = {}
+
+    class _Encoder(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.weight = torch.nn.Parameter(torch.zeros(2, 2))
+
+        def forward(self, input_ids=None, attention_mask=None, use_cache=None, **kw):
+            del kw
+            seen["input_device"] = input_ids.device if input_ids is not None else None
+            seen["mask_device"] = attention_mask.device if attention_mask is not None else None
+            seen["use_cache"] = use_cache
+            return "embeds"
+
+    encoder = module._make_cpu_pinned(_Encoder())
+    assert getattr(encoder, "_310p_forward_wrapped", False) is True
+
+    res = encoder(
+        input_ids=torch.zeros(3, 4, dtype=torch.long),
+        attention_mask=torch.ones(3, 4, dtype=torch.bool),
+        use_cache=False,
+    )
+    assert res == "embeds"
+    # Inputs coerced onto the encoder's (CPU) parameter device; non-tensors pass through.
+    assert seen["input_device"].type == "cpu"
+    assert seen["mask_device"].type == "cpu"
+    assert seen["use_cache"] is False
+
+    # Re-pinning is a no-op: forward is not wrapped twice.
+    wrapped = encoder.forward
+    module._make_cpu_pinned(encoder)
+    assert encoder.forward is wrapped
+
+
 # ---------------------------------------------------------------------------
 # Explicit post-load placement (transformer+VAE -> local device)
 # ---------------------------------------------------------------------------
@@ -641,3 +735,104 @@ def test_registry_dispatch_and_kill_switch(monkeypatch: pytest.MonkeyPatch) -> N
     monkeypatch.setenv("VLLM_OMNI_310P_DIFFUSION_PATCHES", "0")
     registry.apply_diffusion_310p_patches(config)
     assert calls == []
+
+
+# ---------------------------------------------------------------------------
+# Engine-path device handoff + fp64 avoidance (first-run fixes, 2026-11-03)
+# ---------------------------------------------------------------------------
+
+
+def test_encode_prompt_output_moved_to_execution_device(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, _, _, pipeline_mod = _load_mossimage_patch(monkeypatch)
+
+    module._APPLIED = False
+    module.apply_diffusion_310p_patches(_make_od_config())
+
+    cls = pipeline_mod.MOSSImagePipeline
+    assert cls._310p_encode_device_patched is True
+
+    # Same-device passthrough: plain-cpu embeds + plain-cpu transformer ->
+    # tensors pass through without a move (identity preserved).
+    pipe = cls()
+    embeds, mask = pipe.encode_prompt("dummy run")
+    assert embeds.device == torch.device("cpu")
+    assert mask.device == torch.device("cpu")
+
+    # Cross-device: a param-less transformer makes the wrap fall back to
+    # ``pipe.device`` (spoofed as npu:0); both embeds and mask must go through
+    # ``.to()`` (recorded via a stub -- no NPU exists on the test host).
+    class _NoParams(torch.nn.Module):
+        pass
+
+    calls: list[Any] = []
+
+    def _recording_to(self, *args: Any, **kwargs: Any) -> Any:
+        calls.append((self.shape, args, kwargs))
+        return self
+
+    pipe.transformer = _NoParams()
+    pipe.device = torch.device("meta")  # any non-cpu type; no hardware needed
+    with monkeypatch.context() as m:
+        m.setattr(torch.Tensor, "to", _recording_to)
+        pipe.encode_prompt("dummy run")
+    assert len(calls) == 2  # embeds + mask both moved
+    assert all(args and args[0] == torch.device("meta") for _, args, _ in calls)
+
+
+def test_time_modulation_fp32_wrap_replaces_fp64_body(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, _, _, _ = _load_mossimage_patch(monkeypatch)
+
+    transformer_mod = sys.modules["vllm_omni.diffusion.models.mossimage.mossimage_transformer"]
+    cls = transformer_mod.MOSSImageTransformer
+    original = cls._time_modulation  # fake fp64 replica from the helper
+
+    module._APPLIED = False
+    module.apply_diffusion_310p_patches(_make_od_config())
+
+    assert cls._310p_time_mod_fp32 is True
+    assert cls._time_modulation is not original
+
+    # Idempotent: the installer must not re-wrap an already-patched class.
+    patched = cls._time_modulation
+    module._patch_time_modulation_fp32()
+    assert cls._time_modulation is patched
+
+    # Functional: the patched body must compute fp32-only (fp64 promotion
+    # trapped) and return the (mod, head) contract with the right shapes.
+    inst = cls.__new__(cls)
+    inst.time_embedding = torch.nn.Sequential(
+        torch.nn.Linear(8, 4), torch.nn.SiLU(), torch.nn.Linear(4, 4),
+    )
+    inst.shared_block_modulation = torch.nn.Linear(4, 24)
+    inst.video_head_modulation = torch.nn.Linear(4, 8)
+
+    def _no_double(self):
+        raise AssertionError("fp64 promotion must not occur on 310P")
+
+    with monkeypatch.context() as m:
+        m.setattr(torch.Tensor, "double", _no_double)
+        mod, head = inst._time_modulation(torch.tensor([0.5]), 1, torch.device("cpu"))
+    assert mod.shape == (1, 6, 4)
+    assert head.shape == (1, 2, 4)
+    assert mod.dtype == torch.float32 and head.dtype == torch.float32
+
+
+def test_scheduler_sigmas_downcast_to_fp32(monkeypatch: pytest.MonkeyPatch) -> None:
+    module, _, _, pipeline_mod = _load_mossimage_patch(monkeypatch)
+
+    module._APPLIED = False
+    module.apply_diffusion_310p_patches(_make_od_config())
+
+    cls = pipeline_mod.MOSSImageScheduler
+    assert cls._310p_sigmas_fp32 is True
+
+    sched = cls()
+    sched.set_timesteps(2, device=torch.device("cpu"))
+    assert sched.sigmas.dtype == torch.float32
+    assert sched.timesteps.dtype == torch.float32
+
+    # Already-fp32 grids pass through untouched.
+    sched.sigmas = torch.tensor([1.0, 0.0], dtype=torch.float32)
+    sched.timesteps = torch.tensor([999.0], dtype=torch.float32)
+    sched.set_timesteps(2, device=torch.device("cpu"))
+    assert sched.sigmas.dtype == torch.float32
