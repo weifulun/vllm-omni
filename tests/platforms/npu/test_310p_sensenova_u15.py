@@ -107,6 +107,34 @@ class _FakeVision:
         self.fm_modules = {"vision_model_mot_gen": _FakeModule()}
 
 
+class _FakeInt8Layer:
+    """An online-INT8 linear layer as seen by the loader."""
+
+    def __init__(self, quant_method):
+        self._load_device = torch.device("cpu")  # captured under the CPU build pin
+        self.quant_method = quant_method
+
+
+class _FakeModel:
+    def __init__(self, modules: list):
+        self._modules_list = modules
+
+    def modules(self):
+        return iter(self._modules_list)
+
+
+class _DeviceLike:
+    """torch.device stand-in for 'npu:*' (torch_npu not importable on CPU)."""
+
+    def __init__(self, spec: str):
+        self._spec = spec
+        self.type = spec.split(":")[0]
+        self.index = int(spec.split(":")[1]) if ":" in spec else None
+
+    def __str__(self):
+        return self._spec
+
+
 def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     """Install the fake modules sensenova_u15.py imports lazily."""
     captured: dict[str, object] = {}
@@ -183,8 +211,16 @@ def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         return "pipeline"
 
     post_load_calls: list[tuple] = []
+    init_calls: list[tuple] = []
+
+    class FakeInt8LinearMethod:
+        """Online NPU INT8 method stand-in (not the host fallback)."""
 
     class FakeDiffusersPipelineLoader:
+        def _init_from_load_format(self, load_format, target_device, custom_pipeline_name=None, is_hsdp=False):
+            init_calls.append((load_format, str(target_device), custom_pipeline_name, is_hsdp))
+            return captured["fake_model"]
+
         def _process_weights_after_loading(self, model, target_device):
             post_load_calls.append((id(self), model, str(target_device)))
 
@@ -198,6 +234,21 @@ def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
     captured["orig_initialize_model"] = orig_initialize_model
     captured["devices_seen"] = devices_seen
     captured["post_load_calls"] = post_load_calls
+    captured["init_calls"] = init_calls
+    captured["FakeInt8LinearMethod"] = FakeInt8LinearMethod
+    captured["fake_model"] = _FakeModel([])
+
+    # Fake int8_config module: _flip_int8_load_device imports the host
+    # fallback class from it (only when an NPU target device is seen).
+    class FakeUnquantizedHostLinearMethod:
+        pass
+
+    _install_fake_module(
+        monkeypatch,
+        "vllm_omni.quantization.int8_config",
+        UnquantizedHostLinearMethod=FakeUnquantizedHostLinearMethod,
+    )
+    captured["FakeUnquantizedHostLinearMethod"] = FakeUnquantizedHostLinearMethod
 
     # Fake diffusion registry: captures register_diffusion_model calls.
     registry_calls: list[dict] = []
@@ -360,6 +411,54 @@ def test_loader_initialize_model_pinned_to_cpu(monkeypatch: pytest.MonkeyPatch):
     loader_module.initialize_model(_make_od_config())
     assert captured["devices_seen"] == ["cpu"]
     assert getattr(loader_module, "_310p_cpu_build_patched", False) is True
+
+
+def test_int8_load_device_flip_restores_upstream_weight_placement(monkeypatch: pytest.MonkeyPatch):
+    """The CPU construction pin must not leak into the INT8 weight-load device.
+
+    ``npu_dynamic_quant`` has no CPU kernel: layers whose ``_load_device``
+    came out CPU (captured under the pin) die in ``load_weights`` with
+    NotImplementedError.  The wrapper over ``_init_from_load_format`` must
+    flip the online-INT8 layers back to the NPU target - upstream parity -
+    while leaving the over-wide host fallback (UnquantizedHostLinearMethod)
+    and non-quantized modules untouched."""
+    captured = _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+    module.apply_diffusion_310p_patches(_make_od_config(quantization_config=_int8_config()))
+
+    int8_method = object.__new__(captured["FakeInt8LinearMethod"])
+    host_fallback = captured["FakeUnquantizedHostLinearMethod"]()
+    plain_linear = object()  # no _load_device / quant_method -> skipped
+    flipped = _FakeInt8Layer(int8_method)
+    untouched_host = _FakeInt8Layer(host_fallback)
+
+    captured["fake_model"]._modules_list[:] = [flipped, untouched_host, plain_linear]
+
+    # CPU-only torch rejects torch.device("npu:0"); stand it in for the
+    # flip's internal torch.device(str(target)) call.
+    monkeypatch.setattr(torch, "device", _DeviceLike)
+
+    loader_cls = captured["loader_module"].DiffusersPipelineLoader
+    model = loader_cls._init_from_load_format(object(), "default", _DeviceLike("npu:0"))
+
+    assert captured["init_calls"] == [("default", "npu:0", None, False)]
+    assert model is captured["fake_model"]
+    assert str(flipped._load_device) == "npu:0"
+    assert str(untouched_host._load_device) == "cpu"
+    assert not hasattr(plain_linear, "_load_device")
+
+
+def test_int8_load_device_flip_inactive_for_cpu_target(monkeypatch: pytest.MonkeyPatch):
+    captured = _install_patch_fakes(monkeypatch)
+    module = _load_sensenova_patch(monkeypatch)
+    module.apply_diffusion_310p_patches(_make_od_config(quantization_config=_int8_config()))
+
+    flipped = _FakeInt8Layer(object.__new__(captured["FakeInt8LinearMethod"]))
+    captured["fake_model"]._modules_list[:] = [flipped]
+
+    loader_cls = captured["loader_module"].DiffusersPipelineLoader
+    loader_cls._init_from_load_format(object(), "default", _DeviceLike("cpu"))
+    assert str(flipped._load_device) == "cpu"
 
 
 def test_vision_pins_run_after_weight_load(monkeypatch: pytest.MonkeyPatch):

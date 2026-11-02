@@ -235,6 +235,43 @@ def _validate_quantization(od_config: Any) -> None:
     )
 
 
+def _flip_int8_load_device(model: Any, target_device: torch.device) -> int:
+    """Point online-INT8 layers' ``_load_device`` at the target device.
+
+    Companion to ``_install_loader_cpu_build``: construction runs under
+    ``torch.device("cpu")`` (310P construction-time op safety), but online
+    INT8 quantization (``npu_dynamic_quant``) has no CPU kernel, so the
+    layers it owns must still materialize their weights on the accelerator,
+    exactly as in the upstream non-310P flow.  Returns the flipped count.
+    """
+    from vllm_omni.quantization.int8_config import UnquantizedHostLinearMethod
+
+    flipped = 0
+    for module in model.modules():
+        load_device = getattr(module, "_load_device", None)
+        if load_device is None:
+            continue
+        if str(load_device) != "cpu":
+            continue
+        quant_method = getattr(module, "quant_method", None)
+        if quant_method is None:
+            continue
+        if isinstance(quant_method, UnquantizedHostLinearMethod):
+            # Over-wide host fallback: stays in host memory on purpose.
+            continue
+        module._load_device = torch.device(str(target_device))
+        flipped += 1
+    if flipped:
+        logger.info(
+            "[310P][sensenova-u1.5] flipped _load_device of %d online-INT8 "
+            "layers to %s (npu_dynamic_quant has no CPU kernel; over-wide "
+            "host fallback layers untouched)",
+            flipped,
+            target_device,
+        )
+    return flipped
+
+
 def _install_loader_cpu_build() -> None:
     """Run pipeline construction on CPU (310P dynamic-TBE gap, research/012).
 
@@ -265,12 +302,48 @@ def _install_loader_cpu_build() -> None:
 
     loader_mod.initialize_model = _initialize_model_on_cpu
     loader_mod._310p_cpu_build_patched = True  # type: ignore[attr-defined]
-    _LOADER_CPU_BUILD_INSTALLED = True
     logger.info(
         "[310P][sensenova-u1.5] pipeline construction pinned to CPU "
         "(RoPE/vision-RoPE build-time arange/power/division ops would hit the "
         "310P dynamic-TBE RealDiv gap; loader post-load path restores NPU placement)"
     )
+
+    # INT8 online-quantization companion fix: the CPU pin above must NOT leak
+    # into the weight-load device.
+    #
+    # The online INT8 linear method materializes each layer's weight at first
+    # load on ``layer._load_device``, which ``create_weights`` captures from
+    # ``torch.get_default_device()`` - so under the pin above it comes out as
+    # CPU.  ``npu_dynamic_quant`` (online W8A8) has no CPU kernel (torch_npu
+    # 2.10: NotImplementedError 'Could not run npu::npu_dynamic_quant with
+    # arguments from the CPU backend'), so ``load_weights`` dies before the
+    # first shard completes.  The upstream non-310P flow builds the model
+    # under ``with target_device:`` and ``_load_device`` is the NPU - restore
+    # exactly that for the INT8-target layers right after construction.  The
+    # over-wide host-fallback layers (UnquantizedHostLinearMethod, output dim
+    # > 65535, e.g. lm_head 151936) deliberately keep their host placement.
+    loader_cls = getattr(loader_mod, "DiffusersPipelineLoader", None)
+    if loader_cls is not None and not getattr(loader_cls, "_310p_int8_load_device_patched", False):
+        orig_init_from_load_format = loader_cls._init_from_load_format
+
+        def _init_from_load_format_with_int8_fix(
+            self: Any,
+            load_format: Any,
+            target_device: Any,
+            custom_pipeline_name: Any = None,
+            is_hsdp: bool = False,
+        ) -> Any:
+            model = orig_init_from_load_format(
+                self, load_format, target_device, custom_pipeline_name, is_hsdp
+            )
+            if getattr(target_device, "type", None) == "npu":
+                _flip_int8_load_device(model, target_device)
+            return model
+
+        loader_cls._init_from_load_format = _init_from_load_format_with_int8_fix  # type: ignore[method-assign]
+        loader_cls._310p_int8_load_device_patched = True  # type: ignore[attr-defined]
+
+    _LOADER_CPU_BUILD_INSTALLED = True
 
 
 def _install_vision_cpu_pin() -> None:
