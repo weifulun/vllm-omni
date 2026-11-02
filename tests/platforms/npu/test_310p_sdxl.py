@@ -258,13 +258,7 @@ def test_platform_wiring_calls_sdxl_310p_patches() -> None:
     # Source-level pin: the NPU platform's diffusion runtime hook must stay
     # wired to the 310P SDXL patch (import-level tests cannot reach
     # platform.py on a CPU host because of the vllm_ascend dependency).
-    path = (
-        _repo_root()
-        / "vllm_omni"
-        / "platforms"
-        / "npu"
-        / "platform.py"
-    )
+    path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "platform.py"
     source = path.read_text(encoding="utf-8")
     assert "is_310p()" in source
     assert "disable_jit_compile()" in source
@@ -278,15 +272,7 @@ def test_platform_wiring_calls_sdxl_310p_patches() -> None:
 def test_diffusion_registry_dispatches_by_model_arch(monkeypatch: pytest.MonkeyPatch) -> None:
     # Load the patch registry (__init__.py) standalone: it has no heavy
     # top-level imports, so the dispatch contract is testable on CPU.
-    init_path = (
-        _repo_root()
-        / "vllm_omni"
-        / "platforms"
-        / "npu"
-        / "_310p"
-        / "patch"
-        / "__init__.py"
-    )
+    init_path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch" / "__init__.py"
     patch_init = _load_source_module("vllm_omni_test_310p_patch_init", init_path)
 
     calls: list[object] = []
@@ -309,15 +295,7 @@ def test_diffusion_registry_dispatches_by_model_arch(monkeypatch: pytest.MonkeyP
 def test_diffusion_registry_env_escape_hatch(monkeypatch: pytest.MonkeyPatch) -> None:
     """VLLM_OMNI_310P_DIFFUSION_PATCHES=0 selects the generic 310P path (the
     COMPARISON-POLICY.md §1 level-2 same-seed reference run)."""
-    init_path = (
-        _repo_root()
-        / "vllm_omni"
-        / "platforms"
-        / "npu"
-        / "_310p"
-        / "patch"
-        / "__init__.py"
-    )
+    init_path = _repo_root() / "vllm_omni" / "platforms" / "npu" / "_310p" / "patch" / "__init__.py"
     patch_init = _load_source_module("vllm_omni_test_310p_patch_init_env", init_path)
 
     calls: list[object] = []
