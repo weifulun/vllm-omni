@@ -583,16 +583,23 @@ def _install_loader_fp16_guard() -> None:
 
     def _load_weights_310p_fp16(self: Any, model: Any, **kwargs: Any) -> None:
         _orig_load_weights(self, model, **kwargs)
-        p = next(iter(model.parameters()), None)
-        if p is not None and p.dtype is not torch.float16:
+        # The loader passes the WHOLE pipeline as one model; per-submodule
+        # scan so an already-fp16 component (encoder) cannot mask a bf16
+        # sibling (DiT/VAE) whose first-parameter dtype check would pass.
+        cast_names: set[str] = set()
+        for _name, module in model.named_modules():
+            p = next(iter(module.parameters(recurse=False)), None)
+            if p is not None and p.dtype is not torch.float16:
+                module.to(dtype=torch.float16)
+                cast_names.add(type(module).__name__)
+        if cast_names:
             logger.warning(
-                "[310P][flux2-klein] %s weights loaded as %s; casting to "
+                "[310P][flux2-klein] %s: casting bf16 submodules %s to "
                 "float16 in place (310P is FP16-only hardware)",
                 type(model).__name__,
-                p.dtype,
+                sorted(cast_names),
             )
-            model.to(dtype=torch.float16)
-            _evidence("loader-cast", f"{type(model).__name__} {p.dtype} -> fp16")
+            _evidence("loader-cast", f"{type(model).__name__} {sorted(cast_names)}")
         else:
             _evidence("loader-ok", f"{type(model).__name__} already-fp16")
 
