@@ -83,6 +83,14 @@ transformer, conv2d VAE instead of the conv3d family):
    relative modulation delta; the sigma values are fp32-derived anyway) and
    restore the release's documented "Euler updates use fp32" contract.
 
+10. VAE attention: the FLUX.2 VAE mid-block ships ``AttnProcessor2_0``
+   (``F.scaled_dot_product_attention`` -> fused aclnn SDPA op), unsupported
+   on 310P3 (machine-verified dummy-run crash: ``can not cast format when
+   output is input`` + ERR01007).  ``_install_vae_eager_attention`` swaps the
+   eager ``AttnProcessor`` -- diffusers' reference implementation of the
+   same attention (incl. the FLUX ``spatial_norm`` temb modulation; standalone
+   fp32 decode verified at 512/1024).
+
 ``VLLM_OMNI_310P_DIFFUSION_PATCHES=0`` disables the whole dispatch (the
 COMPARISON-POLICY.md section 1 level-2 same-seed reference hook).
 """
@@ -536,6 +544,30 @@ def _patch_pipeline_encoder_placement(pipeline_module: Any) -> None:
     pipeline_module._310p_encoder_patched = True
 
 
+def _install_vae_eager_attention(vae: Any) -> None:
+    """Swap the VAE's SDPA attention processors for the eager reference.
+
+    The FLUX.2 VAE's mid-block attention ships ``AttnProcessor2_0``, whose
+    ``F.scaled_dot_product_attention`` call dispatches to the fused aclnn
+    SDPA op -- unsupported on 310P3 (machine-verified, first dummy run
+    2026-11-03: ``can not cast format when output is input`` +
+    ``ERR01007 OPS feature not supported``; standalone VAE probe).  The eager
+    ``AttnProcessor`` is diffusers' reference implementation of the identical
+    attention (same QKV projections, same FLUX ``spatial_norm`` temb
+    modulation, fp32 softmax) -- no precision change vs the upstream CUDA
+    path, which the probe confirmed (fp32 decode OK at 512 and 1024).
+
+    Non-``ModelMixin`` stand-ins (test doubles, exotic VAE subclasses) that
+    lack ``set_attn_processor`` are skipped: the swap is a kernel-selection
+    optimization for the known FLUX.2 mid-block, not a placement step.
+    """
+    if not hasattr(vae, "set_attn_processor"):
+        return
+    from diffusers.models.attention_processor import AttnProcessor
+
+    vae.set_attn_processor(AttnProcessor())
+
+
 def _install_post_load_placement() -> None:
     """Move transformer+VAE to the local NPU after weight loading.
 
@@ -562,6 +594,7 @@ def _install_post_load_placement() -> None:
             self.transformer.to(target)
         if getattr(self, "vae", None) is not None:
             self.vae.to(target)
+            _install_vae_eager_attention(self.vae)
         logger.info(
             "310P MOSS-Image: post-load placement done (transformer/vae -> %s; "
             "text_encoder stays CPU-pinned).",

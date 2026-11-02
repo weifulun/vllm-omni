@@ -651,6 +651,7 @@ def test_post_load_placement_moves_transformer_and_vae(monkeypatch: pytest.Monke
     module._APPLIED = False
 
     moves: dict[str, list[Any]] = {"transformer": [], "vae": [], "text_encoder": []}
+    attn_swaps: list[Any] = []
 
     class _SpyLinear(torch.nn.Linear):
         _spy_name = "unknown"
@@ -664,6 +665,9 @@ def test_post_load_placement_moves_transformer_and_vae(monkeypatch: pytest.Monke
 
     class _SpyVAE(_SpyLinear):
         _spy_name = "vae"
+
+        def set_attn_processor(self, processor):  # noqa: D102
+            attn_swaps.append(processor)
 
     class _SpyEncoder(_SpyLinear):
         _spy_name = "text_encoder"
@@ -693,6 +697,18 @@ def test_post_load_placement_moves_transformer_and_vae(monkeypatch: pytest.Monke
     assert moves["transformer"] == [torch.device("cpu")]
     assert moves["vae"] == [torch.device("cpu")]
     assert moves["text_encoder"] == []
+
+    # VAE attention kernel swap: exactly one install, and the processor is
+    # diffusers' reference AttnProcessor (NOT the SDPA AttnProcessor2_0 that
+    # crashes on 310P3).
+    from diffusers.models.attention_processor import (  # noqa: PLC0415
+        AttnProcessor,
+        AttnProcessor2_0,
+    )
+
+    assert len(attn_swaps) == 1
+    assert isinstance(attn_swaps[0], AttnProcessor)
+    assert not isinstance(attn_swaps[0], AttnProcessor2_0)
 
     # Idempotent: second install is a no-op (wrap not stacked twice).
     first_wrap = pipeline_mod.MOSSImagePipeline.load_weights
