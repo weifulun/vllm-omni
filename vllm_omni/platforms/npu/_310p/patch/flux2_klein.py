@@ -518,6 +518,27 @@ def _install_dit_fp16_guard() -> None:
         Flux2Transformer2DModel,
     )
 
+    _orig_load_weights = getattr(Flux2Transformer2DModel, "load_weights", None)
+    if _orig_load_weights is not None:
+
+        def _load_weights_310p_fp16(self: Any, weights: Any, *a: Any, **k: Any) -> Any:
+            loaded = _orig_load_weights(self, weights, *a, **k)
+            p = next(iter(self.parameters()), None)
+            if p is not None and p.dtype is not torch.float16:
+                logger.warning(
+                    "[310P][flux2-klein] DiT weights loaded as %s; casting to "
+                    "float16 in place (310P is FP16-only hardware)",
+                    p.dtype,
+                )
+                self.to(dtype=torch.float16)
+                _evidence("dit-load-cast", f"loaded {p.dtype} -> fp16")
+            return loaded
+
+        Flux2Transformer2DModel.load_weights = _load_weights_310p_fp16
+        _sys.modules[
+            "vllm_omni.diffusion.models.flux2_klein.flux2_klein_transformer"
+        ].Flux2Transformer2DModel.load_weights = _load_weights_310p_fp16
+
     _orig_forward = Flux2Transformer2DModel.forward
 
     def _forward_310p_fp16(self: Any, *args: Any, **kwargs: Any) -> Any:
@@ -529,6 +550,7 @@ def _install_dit_fp16_guard() -> None:
                 p.dtype,
             )
             self.to(dtype=torch.float16)
+            _evidence("dit-forward-cast", f"loaded {p.dtype} -> fp16")
         return _orig_forward(self, *args, **kwargs)
 
     _sys.modules[

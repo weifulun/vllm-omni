@@ -187,6 +187,9 @@ def _install_patch_fakes(monkeypatch: pytest.MonkeyPatch) -> dict[str, object]:
         def __init__(self, *args, **kwargs):
             pass
 
+        def load_weights(self, weights):
+            return set()
+
         def forward(self, *args, **kwargs):
             return "dit"
 
