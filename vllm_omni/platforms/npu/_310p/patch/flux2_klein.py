@@ -28,6 +28,11 @@ Invariants enforced here:
   out of scope for the t2i baseline.
 * LoRA is accepted with a loud warning (out of scope for the parity
   baseline; weights differ from the reference run by design).
+* Chain-1 OOM downgrade (lead-fixed order): when the chip's 21589 MB budget
+  is exceeded, ``FLUX2KLEIN_310P_ENCODER_CPU=1`` pins the Qwen3 text
+  encoder on host memory (same playbook as model-qwenimg21 M8/R12); the
+  wrapper moves it back after pipeline construction.  Chain-2 (SP=2) stays
+  gated on the task-5/task-7 HCCL validation.
 * VAE decode is forced onto the diffusers tiling/slicing path before the
   pipeline is loaded: the untiled 1024^2 decode peak is 8 GB+ of activations,
   which does not fit the 24 GB per-chip budget with weights resident
@@ -48,6 +53,7 @@ Component placement (logged at startup, matches the pipeline's own
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any
 
 import torch
@@ -70,6 +76,9 @@ _NUMERICAL_CACHE_BACKENDS = frozenset(
 _APPLIED = False
 _ATTENTION_GUARD_INSTALLED = False
 _VAE_TILING_WRAPPED = False
+
+#: Chain-1 OOM downgrade: pin the Qwen3 text encoder on host memory.
+_ENCODER_CPU_ENV = "FLUX2KLEIN_310P_ENCODER_CPU"
 
 
 def _force_fp16(od_config: Any) -> None:
@@ -192,6 +201,15 @@ def _install_vae_tiling_wrap() -> None:
     def _init_with_vae_tiling(self, *args, **kwargs):
         original_init(self, *args, **kwargs)
         self._310p_vae_tiling = _maybe_enable_vae_tiling(self.vae)
+        if os.environ.get(_ENCODER_CPU_ENV, "0") == "1":
+            self.text_encoder = self.text_encoder.to("cpu")
+            self._310p_encoder_cpu = True
+            logger.warning(
+                "[310P][flux2-klein] text encoder pinned to CPU via %s "
+                "(chain-1 OOM downgrade, chip budget 21589 MB); per-request "
+                "H2D/D2H expected, encode stage timed separately.",
+                _ENCODER_CPU_ENV,
+            )
 
     Flux2KleinPipeline.__init__ = _init_with_vae_tiling
     _VAE_TILING_WRAPPED = True

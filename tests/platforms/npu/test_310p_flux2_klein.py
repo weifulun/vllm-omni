@@ -102,9 +102,19 @@ class _FakeVAE:
 
 
 def _make_fake_pipeline_module(monkeypatch: pytest.MonkeyPatch, vae: object) -> object:
+    class FakeEncoder:
+        def __init__(self):
+            # The pipeline __init__ places components on the local chip.
+            self.device = "npu"
+
+        def to(self, device):
+            self.device = device
+            return self
+
     class FakeFlux2KleinPipeline:
         def __init__(self):
             self.vae = vae
+            self.text_encoder = FakeEncoder()
 
     return _install_fake_module(
         monkeypatch,
@@ -305,6 +315,33 @@ def test_vae_tiling_missing_api_warns_but_boots(monkeypatch: pytest.MonkeyPatch,
     assert vae.calls == []
     assert pipeline._310p_vae_tiling is False
     assert "tiling" in caplog.text.lower()
+
+
+def test_encoder_cpu_downgrade_env_switch(monkeypatch: pytest.MonkeyPatch):
+    """Chain-1 OOM downgrade (lead-fixed order): FLUX2KLEIN_310P_ENCODER_CPU=1
+    pins the Qwen3 text encoder on host memory after pipeline construction."""
+    _install_patch_fakes(monkeypatch)
+    pipeline_module = _make_fake_pipeline_module(monkeypatch, _FakeVAE())
+    module = _load_flux2_klein_patch(monkeypatch)
+    monkeypatch.setenv("FLUX2KLEIN_310P_ENCODER_CPU", "1")
+
+    module.apply_diffusion_310p_patches(_make_od_config())
+
+    pipeline = pipeline_module.Flux2KleinPipeline()
+    assert pipeline.text_encoder.device == "cpu"
+    assert pipeline._310p_encoder_cpu is True
+
+
+def test_encoder_stays_on_chip_by_default(monkeypatch: pytest.MonkeyPatch):
+    _install_patch_fakes(monkeypatch)
+    pipeline_module = _make_fake_pipeline_module(monkeypatch, _FakeVAE())
+    module = _load_flux2_klein_patch(monkeypatch)
+
+    module.apply_diffusion_310p_patches(_make_od_config())
+
+    pipeline = pipeline_module.Flux2KleinPipeline()
+    assert pipeline.text_encoder.device == "npu"
+    assert not getattr(pipeline, "_310p_encoder_cpu", False)
 
 
 def test_patch_is_idempotent_per_process(monkeypatch: pytest.MonkeyPatch):
