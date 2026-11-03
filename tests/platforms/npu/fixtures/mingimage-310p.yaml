@@ -1,7 +1,9 @@
 # Ming-Image 310P 配方 A 放置变体(官方 deploy/ming_image.yaml 的 310P 运行时覆写,容器内使用,仓库不动)
-# 配方 A'(lead O1 裁决 11-03 12:4x,取代 TP2):MLLM stage0 **TP3** devices 0,1,3(≈6.5GB/芯,AR 装载相墙后余量 ~3×)
-# + DiT stage1 TP1 device 2(15.8GB,83% 峰实证)。容器逻辑 0,1,2,3 = 物理 davinci4,5,6,7。
-# TP3=310P 未验证并行档:首跑第一动作=TP3 init 探针窗(HCCL 任意组,含跨 PCIe dav45↔dav7;EH0012 族→stop-and-report)。
+# 配方 A''(lead O1b 裁决 11-03 12:5x,取代 TP2/TP3):MLLM stage0 **PP2**(tp=1, pp=2)devices 0,1
+# (≈9.2GB/芯:层切 8.5GB+复制 embedding 0.65GB,装载相墙彻底解除,余量 ~2.2×)+ DiT stage1 TP1 device 2(15.8GB,83% 峰实证)
+# + dav7(device 3)全窗余量。容器逻辑 0,1,2,3 = 物理 davinci4,5,6,7。
+# PP2 新面=AR 层间 send/recv 管道:首跑第一动作=PP2 init 探针窗(HCCL 2 成员组=TP2 同族实证面;EH0012 族→stop-and-report)。
+# TP3 已被架构面封死(AR heads=16,16%3≠0,vLLM VllmConfig 硬拒)——放置结论入 012。
 # FP16-only:top-level dtype 显式 float16(310P 不变量;diffusion patch 另有 od_config 强制兜底)
 pipeline: ming_image
 async_chunk: false
@@ -14,8 +16,9 @@ enable_prefix_caching: false
 stages:
   - stage_id: 0
     enforce_eager: true
-    tensor_parallel_size: 3
-    devices: "0,1,3"
+    tensor_parallel_size: 1
+    pipeline_parallel_size: 2
+    devices: "0,1"
     gpu_memory_utilization: 0.55
     max_num_seqs: 1
     output_connectors:

@@ -187,22 +187,39 @@ def _split_devices(raw: object) -> list[str]:
     return [tok.strip() for tok in raw.split(",") if tok.strip()]
 
 
+def _world_size(stage: dict) -> int:
+    """Strategy world size = tp * dp * pp (all default 1 when absent)."""
+    return (
+        int(stage.get("tensor_parallel_size", 1))
+        * int(stage.get("data_parallel_size", 1))
+        * int(stage.get("pipeline_parallel_size", 1))
+    )
+
+
 class TestPlacementSurface:
-    def test_stage0_tp3_devices_consistent(self) -> None:
+    def test_stage0_pp2_devices_consistent(self) -> None:
+        """Recipe A'': stage0 AR at PP2 (tp=1, pp=2) on logical devices 0,1.
+
+        TP3 was architecturally dead (AR heads=16, 16 % 3 != 0 -> VllmConfig
+        hard reject, probe run 2); PP2 splits the 20 layers across two dies
+        (~9.2 GB/chip, load-phase wall cleared per lead O1b ruling).
+        """
         stages = _load_recipe_fixture()["stages"]
         stage0 = stages[0]
-        assert stage0["tensor_parallel_size"] == 3
+        assert stage0["tensor_parallel_size"] == 1
+        assert stage0["pipeline_parallel_size"] == 2
         devs = _split_devices(stage0["devices"])
-        assert devs == ["0", "1", "3"]
-        assert len(devs) == stage0["tensor_parallel_size"]
+        assert devs == ["0", "1"]
+        assert len(devs) == _world_size(stage0)
 
     def test_stage1_tp1_single_device(self) -> None:
         stages = _load_recipe_fixture()["stages"]
         stage1 = stages[1]
         assert stage1["tensor_parallel_size"] == 1
+        assert "pipeline_parallel_size" not in stage1
         devs = _split_devices(stage1["devices"])
         assert devs == ["2"]
-        assert len(devs) == stage1["tensor_parallel_size"]
+        assert len(devs) == _world_size(stage1)
 
     def test_stages_disjoint_devices(self) -> None:
         stages = _load_recipe_fixture()["stages"]
