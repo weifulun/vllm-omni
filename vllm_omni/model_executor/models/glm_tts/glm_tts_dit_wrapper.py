@@ -548,6 +548,7 @@ class GLMTTSDiTForGeneration(nn.Module):
                     chunk_sizes_history=chunk_sizes_history,
                     block_pattern=block_pattern,
                     crossfade_sec=crossfade_sec,
+                    seed=seed,
                 )
                 if stream_finished and req_id is not None:
                     with self._stream_cache_lock:
@@ -559,6 +560,7 @@ class GLMTTSDiTForGeneration(nn.Module):
                     prompt_token=prompt_token,
                     prompt_feat=prompt_feat,
                     embedding=embedding,
+                    seed=seed,
                 )
 
             audios[idx] = audio.reshape(-1).to(dtype=torch.float32)
@@ -602,6 +604,7 @@ class GLMTTSDiTForGeneration(nn.Module):
         chunk_sizes_history: list[int] | None = None,
         block_pattern: list[int] | None = None,
         crossfade_sec: float = 0.1,
+        seed: int | None = None,
     ) -> torch.Tensor:
         """DiT flow-matching + vocoder pipeline. Returns audio waveform."""
         device = speech_tokens.device
