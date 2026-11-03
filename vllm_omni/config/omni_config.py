@@ -304,6 +304,9 @@ class _StageEngineValues:
     compilation_config: Mapping[str, Any] | VllmCompilationConfig | None
     profiler_config: Mapping[str, Any] | VllmProfilerConfig | None
     speculative_config: Mapping[str, Any] | VllmSpeculativeConfig | None
+    # vLLM-native UVA CPU weight offload (GB per device), passed through to
+    # AsyncEngineArgs.cpu_offload_gb for llm stages.
+    cpu_offload_gb: float | None
 
 
 @dataclass(frozen=True)
@@ -1301,6 +1304,13 @@ _COMMON_STAGE_ENGINE_FIELDS = (
     | _RUNTIME_ENGINE_FIELDS
     | _DIRECT_VLLM_CONFIG_ENGINE_FIELDS
 )
+# vLLM-native UVA CPU weight offload for llm stages (engine_extras
+# ``cpu_offload_gb``): the 310P minimax-h3 TP4 line needs the AR encoder's
+# weights host-offloaded because the encoder (15.75 GB/chip) and the DiT
+# (16.6 GB/chip) cannot co-reside on a 21.08 GiB chip (round-1 boot OOM,
+# 128 C1+C2). Owned by the LLM stages only — diffusion stages have their own
+# offload strategies (MODEL_LEVEL / LAYER_WISE / DLO).
+_LLM_UVA_OFFLOAD_ENGINE_FIELDS = frozenset({"cpu_offload_gb"})
 _LLM_STAGE_ENGINE_FIELDS = (
     _COMMON_STAGE_ENGINE_FIELDS
     | _LLM_LOAD_ENGINE_FIELDS
@@ -1309,6 +1319,7 @@ _LLM_STAGE_ENGINE_FIELDS = (
     | _LLM_PARALLEL_CONFIG_ENGINE_FIELDS
     | _POOLING_ENGINE_FIELDS
     | {"parallel_config"}
+    | _LLM_UVA_OFFLOAD_ENGINE_FIELDS
 )
 _DIFFUSION_OWNED_STAGE_ENGINE_FIELDS = (
     _COMMON_STAGE_ENGINE_FIELDS
@@ -1646,6 +1657,7 @@ def _stage_engine_values(
         # silently disappears (no error) and speculative decoding loses effect
         # (engine logs show speculative_config=None).
         speculative_config=_copy_value(engine.get("speculative_config")),
+        cpu_offload_gb=_copy_value(engine.get("cpu_offload_gb")),
     )
 
 
@@ -1715,6 +1727,8 @@ class BaseVllmOmniStageConfig:
     # dict early and break that step with "SpeculativeConfig object has no
     # attribute 'items'". Keep the Mapping shape and let vLLM do the conversion.
     speculative_config: Mapping[str, Any] | None = None
+    # vLLM-native UVA CPU weight offload (GB per device); llm stages only.
+    cpu_offload_gb: float | None = None
     quantization_config: _QuantizationConfigType = None
 
     @property
@@ -1888,6 +1902,7 @@ def _build_common_stage_config_kwargs(
             "compilation_config": _copy_value(engine.compilation_config),
             "profiler_config": _copy_value(engine.profiler_config),
             "speculative_config": _copy_value(engine.speculative_config),
+            "cpu_offload_gb": _copy_value(engine.cpu_offload_gb),
             "quantization_config": _copy_value(quantization_config),
         },
         input_proc,
