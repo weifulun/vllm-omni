@@ -3,13 +3,18 @@
 # runtime matmul (aclnnQuantMatmulV5 -> 161002, parameter-independent sweep),
 # so the INT8 line (POLICY §2 tier-2) cannot produce a forward on 310P in
 # this build. POLICY §2 tier-1 = FP16 placement:
-# * stage 0 (Qwen3-VL-32B AR encoder) FP16 TP4: 66.7 GB / 4 = ~16.7 GB/chip
-#   + CANN baseline ~1.2 GB + KV pool -> fits the 21.6 GB chip budget; if the
-#   KV margin is tight at e2e time, enable_cpu_offload: true (vLLM-native AR
-#   host offload; the vllm-omni llm_ar LWO knob is NOT the mechanism — config
-#   ownership rejects it, measured).
-# * stage 1 (33.1B DiT) FP16 TP4: ~66.2 GB / 4 = 16.6 GB/chip, no DLO needed
-#   (headroom for the ~1.6 GB attention slab).
+# * stage 1 (33.1B DiT) FP16 TP4: ~66.2 GB / 4 = 16.6 GB/chip resident, no DLO.
+# * stage 0 (Qwen3-VL-32B AR encoder) FP16 TP4: 63 GB / 4 = ~15.75 GB/chip is
+#   NOT co-resident with the DiT (16.6 + 15.75 + VAE + CANN ~= 36 GB/chip >
+#   21.08 chip budget) — round-1 boot OOM proved it (stage1 resident, stage0
+#   weight load died at 4.0 GiB). Encoder weights are therefore UVA host
+#   offloaded: vLLM-native `cpu_offload_gb` (GO-approved --cpu-offload-gb
+#   mechanism), weights pinned in host DRAM, NPU reads via UVA/SVM (vllm
+#   model_executor/offloader/uva.py; functional_call on-demand fallback if
+#   UVA is unavailable on this accelerator). The vllm-omni stage-level
+#   enable_cpu_offload is the DIFFUSION-side MODEL_LEVEL offload and is NOT
+#   wired to llm_ar stages — do not use it for the AR encoder; the llm_ar LWO
+#   knob is config-rejected as well (measured).
 # * stage 2 VAE tiled on the same 4 chips.
 # dtype float16 pinned at serve time; attention TORCH_SDPA math fallback;
 # ulysses_degree 1. Same pipeline as the 310P INT8 line.
@@ -27,6 +32,15 @@ stages:
     max_num_batched_tokens: 2048
     enforce_eager: true
     model: /models/FL2VA/text_encoder
+    engine_extras:
+      # UVA host offload of the AR encoder weights (round-1 OOM fix): 16 GB per
+      # chip ~= the full per-chip encoder shard (63 GB / 4 = 15.75 GB), leaving
+      # only embeddings-class residue on the NPU. Per-chip budget: 16.6 DiT +
+      # ~1.2 CANN baseline + ~1.3 VAE + ~1.5 auto-sized KV (profiles against
+      # real free memory at init; DiT resident first) ~= 20.6 <= 21.08.
+      # Requires EPLB off (dense encoder, default) and no input-batch reinit
+      # (single KV group, standard block size) — both hold here.
+      cpu_offload_gb: 16.0
     hf_overrides:
       minimax_h3_encoder_components:
         text_encoder:
