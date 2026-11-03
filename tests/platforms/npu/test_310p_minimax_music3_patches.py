@@ -94,6 +94,28 @@ class _FakeAcousticModel(nn.Module):
         self._loaded = False
 
 
+class _FakeRequestARState:
+    """The talker's per-pair state surface the symmetric-pair-stop seam sees."""
+
+    def __init__(self, *, seed: int, max_frames: int, prompt_tokens: int = 0) -> None:
+        self.seed = seed
+        self.max_frames = max_frames
+        self.prompt_tokens = prompt_tokens
+
+
+def _fake_state_for(self, pair_id, row):
+    """The stock ``_state_for`` semantics against the fake state class."""
+    state = self._states.get(pair_id)
+    if state is None:
+        state = _FakeRequestARState(
+            seed=self._row_seeds[row],
+            max_frames=self._row_max_frames[row],
+            prompt_tokens=self._row_prompt_tokens[row],
+        )
+        self._states[pair_id] = state
+    return state
+
+
 def _install_minimax_fakes(monkeypatch: pytest.MonkeyPatch, root: Path):
     """Install fake minimax_music3 modules; return (patch module, fakes)."""
     pkg_name = "vllm_omni.model_executor.models.minimax_music3"
@@ -197,6 +219,8 @@ def _install_minimax_fakes(monkeypatch: pytest.MonkeyPatch, root: Path):
         def _write_frame_feedback(self, feedback_rows, feedback_codes, device):
             raise AssertionError("stock frame-feedback writer must be replaced")
 
+    _FakeTalker._state_for = _fake_state_for
+
     talker = _install_fake_module(
         monkeypatch,
         f"{pkg_name}.talker",
@@ -207,6 +231,7 @@ def _install_minimax_fakes(monkeypatch: pytest.MonkeyPatch, root: Path):
         sample_topk_seeded=sampling.sample_topk_seeded,
         MiniMaxMusic3TalkerForConditionalGeneration=_FakeTalker,
         PinnedIndexStage=_FakePinnedIndexStage,
+        RequestARState=_FakeRequestARState,
     )
     _install_fake_module(
         monkeypatch,
@@ -246,6 +271,8 @@ def _reset_patch_state(patch: types.ModuleType) -> None:
     patch._TALKER_PATCHED = False
     patch._ACOUSTIC_PATCHED = False
     patch._NOISE_FALLBACK = False
+    if hasattr(patch, "_ORIG_STATE_FOR"):
+        patch._ORIG_STATE_FOR = None
 
 
 def _fresh(monkeypatch: pytest.MonkeyPatch, root: Path):
@@ -724,3 +751,62 @@ def test_write_frame_feedback_twin_fills_flags_without_index_fill(monkeypatch):
     model._write_frame_feedback([], [], torch.device("cpu"))
     assert not model.frame_feedback_active.any()
     assert model._feedback_positions is None
+
+
+# ---------------------------------------------------------------------------
+#  Stage 0: symmetric pair stop (KV-thin CFG budget)
+# ---------------------------------------------------------------------------
+
+
+def _pair_stop_stub(max_frames: int):
+    class _Stub:
+        _states = {}
+        _row_seeds = [42]
+        _row_max_frames = [max_frames]
+        _row_prompt_tokens = [1380]
+
+    return _Stub()
+
+
+def test_pair_stop_shrinks_frame_budget_exactly_once(monkeypatch):
+    """The seam shortens the model-side frame budget by the control-token
+    slack at state creation and never applies it twice (cached pair state)."""
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    monkeypatch.delenv(patch._PAIR_STOP_SLACK_ENV, raising=False)
+    patch.apply_talker_patches()
+
+    talker_cls = fakes["talker"].MiniMaxMusic3TalkerForConditionalGeneration
+    assert talker_cls._state_for is not _fake_state_for  # wrapped
+    stub = _pair_stop_stub(3200)
+    state = talker_cls._state_for(stub, "pair-1", 0)
+    assert state.max_frames == 3200 - patch._PAIR_STOP_SLACK_DEFAULT
+    # Same pair: the cached state comes back untouched.
+    again = talker_cls._state_for(stub, "pair-1", 0)
+    assert again is state
+    assert again.max_frames == 3200 - patch._PAIR_STOP_SLACK_DEFAULT
+    # A fresh pair is shrunk from the FULL budget again.
+    fresh = talker_cls._state_for(stub, "pair-2", 0)
+    assert fresh.max_frames == 3200 - patch._PAIR_STOP_SLACK_DEFAULT
+
+
+def test_pair_stop_slack_zero_keeps_stock_budget(monkeypatch):
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    monkeypatch.setenv(patch._PAIR_STOP_SLACK_ENV, "0")
+    patch.apply_talker_patches()
+
+    state = fakes["talker"].MiniMaxMusic3TalkerForConditionalGeneration._state_for(
+        _pair_stop_stub(3200), "pair-1", 0
+    )
+    assert state.max_frames == 3200
+
+
+def test_pair_stop_kill_switch_leaves_state_for_stock(monkeypatch):
+    root = _repo_root()
+    patch, fakes = _fresh(monkeypatch, root)
+    monkeypatch.setenv(patch._KILL_SWITCH_ENV, "0")
+    talker_cls = fakes["talker"].MiniMaxMusic3TalkerForConditionalGeneration
+    stock = talker_cls._state_for
+    patch.apply_talker_patches()  # no-op with the kill switch
+    assert talker_cls._state_for is stock

@@ -112,6 +112,41 @@ def _kill_switch_off() -> bool:
 # ===================================================================
 
 
+# ---------------------------------------------------------------------------
+#  Symmetric pair stop (KV-thin CFG budget)
+#
+# The client field ``max_new_tokens`` doubles as BOTH the engine's per-row
+# token budget and the talker's frame budget (``max_audio_frames``). The
+# rows' control tokens (pause / window markers) draw on the SAME token
+# budget, so the engine length-caps one CFG row about 71 frames before the
+# pair's frame budget is reached. The surviving row is then released
+# unguided and its tail discarded (measured runA 2026-11-02: pair split at
+# frame 3,229 of 3,300, stage-1 600 s stall, client 500 after ~65 min),
+# and the preempted row can never be re-admitted while the survivor holds
+# its KV. On 310P the KV margin is too thin (9,472-token pool vs 9,360
+# peak demand at 3,300 frames) to survive that tail, so the model-side
+# frame budget is shortened by a control-token slack: the pair then
+# retires symmetrically on the model-side length path (both rows, same
+# step, one drain step) before the engine can length-cap any single row.
+# The slack covers the measured 71 control tokens of the seed-42 run with
+# margin; ``0`` restores the stock behavior for the comparison run.
+_PAIR_STOP_SLACK_ENV = "VLLM_OMNI_310P_M3_PAIR_STOP_SLACK"
+_PAIR_STOP_SLACK_DEFAULT = 100
+
+
+def _pair_stop_slack() -> int:
+    try:
+        value = int(os.environ.get(_PAIR_STOP_SLACK_ENV, str(_PAIR_STOP_SLACK_DEFAULT)))
+    except ValueError:
+        logger.warning(
+            "MiniMax Music 3 310P: %s is not an integer; using %d",
+            _PAIR_STOP_SLACK_ENV,
+            _PAIR_STOP_SLACK_DEFAULT,
+        )
+        return _PAIR_STOP_SLACK_DEFAULT
+    return max(0, value)
+
+
 def _cpu_faithful(orig):
     """Wrap a sampler primitive so NPU inputs run on the host.
 
@@ -240,6 +275,34 @@ def _write_frame_feedback_310p(
     self._feedback_codes = codes
 
 
+def _state_for_310p(self, pair_id: str, row: int):
+    """``_state_for`` with the pair's model-side frame budget shortened.
+
+    The shrink happens once, when the state is created, so the stock
+    ``generated_frames >= max_frames`` check in the per-pair loop retires
+    BOTH rows of the pair on the same step (plus the one drain step the
+    design already schedules) instead of the engine length-capping one row
+    first. Calls for an already-created pair return the cached state
+    untouched, so the budget is applied exactly once.
+    """
+    was_cached = self._states.get(pair_id) is not None
+    state = _ORIG_STATE_FOR(self, pair_id, row)
+    slack = _pair_stop_slack()
+    if not was_cached and slack > 0 and state.max_frames > slack:
+        logger.info(
+            "MiniMax Music 3 310P: pair %s frame budget %d -> %d "
+            "(symmetric pair stop, control-token slack %d)",
+            pair_id,
+            state.max_frames,
+            state.max_frames - slack,
+            slack,
+        )
+        state.max_frames = state.max_frames - slack
+    return state
+
+
+_ORIG_STATE_FOR = None
+
 _TALKER_ARCH_NAME = "MiniMaxMusic3TalkerForConditionalGeneration"
 
 
@@ -311,9 +374,11 @@ def apply_talker_patches() -> None:
 
     Swaps the five sampler primitives in the talker namespace for host-side
     seams and the depth-decoder block forward for its decomposed-attention
-    twin. The generic model modules stay unchanged, and the ``DepthGraphCache``
-    needs no patch: it already refuses capture unless its inputs are CUDA
-    tensors, so on NPU it stays on the eager loop.
+    twin, and wraps ``_state_for`` so the pair's model-side frame budget is
+    shortened by the control-token slack (symmetric pair stop under the
+    KV-thin CFG budget). The generic model modules stay unchanged, and the
+    ``DepthGraphCache`` needs no patch: it already refuses capture unless its
+    inputs are CUDA tensors, so on NPU it stays on the eager loop.
 
     Idempotent. No-ops with a warning when the kill switch is set.
     """
@@ -336,6 +401,15 @@ def apply_talker_patches() -> None:
     _talker_module.MiniMaxMusic3TalkerForConditionalGeneration._write_frame_feedback = (
         _write_frame_feedback_310p
     )
+
+    # Symmetric pair stop: shorten the model-side frame budget so the pair
+    # retires on the model-side length path before the engine's token budget
+    # (shared with the control tokens) can length-cap one CFG row first.
+    global _ORIG_STATE_FOR
+    talker_cls = _talker_module.MiniMaxMusic3TalkerForConditionalGeneration
+    if _ORIG_STATE_FOR is None:
+        _ORIG_STATE_FOR = talker_cls._state_for
+    talker_cls._state_for = _state_for_310p
 
     # The 310P embedding method keeps BOTH the fp16 weight and a fractal-NZ
     # copy (``layer.weight_nz = maybe_trans_nz(layer.weight)``), unlike the
