@@ -1,8 +1,9 @@
 # Ming-Image 310P 配方 A 放置变体(官方 deploy/ming_image.yaml 的 310P 运行时覆写,容器内使用,仓库不动)
-# 配方 A''(lead O1b 裁决 + 13:2x 改钉):MLLM stage0 **PP2**(tp=1, pp=2)devices **2,3**=dav6,7(card4 同卡对=组内同卡拓扑最优)
-# (≈9.2GB/芯:层切 8.5GB+复制 embedding 0.65GB,装载相墙彻底解除,余量 ~2.2×)+ DiT stage1 TP1 device **1**=dav5(card3 chip1,6% 干净实证)
-# + logical 0=dav4 **死 die 闲置**(card3 chip0 post-fault MCU 残留,仅维护窗 OS reboot 可解,18:00 日报一行)。
-# 容器逻辑 0,1,2,3 = 物理 davinci4,5,6,7。PP2 探针窗重开=验证跑 #4(HCCL 2 成员组=TP2 同族实证面;EH0012 族→stop-and-report)。
+# 配方 A''(lead O1b 裁决;14:5x 回原钉):MLLM stage0 **PP2**(tp=1, pp=2)devices **0,1**=dav4,5(card3 同卡对)
+# (≈9.2GB/芯 驻留档:层切 8.5GB+复制 embedding 0.65GB;装载相墙仍待装载器切片手术解除——ModelNetLoaderElastic 全流物化签名在案)
+# + DiT stage1 TP1 device **2**=dav6(15.8GB 档,338/338 装载实证)+ device 3=dav7 全窗余量。
+# 回钉依据:env-ops 14:43 chip 级核=dav4 死面清除(1485/21589 驱动带,8 chip Aicore 0/Health OK;13:15 的 100% 驻留已被改钉探针的卡级设备初始化重探顺带覆盖)。
+# 容器逻辑 0,1,2,3 = 物理 davinci4,5,6,7。装载器手术 GO 后 PP2 探针窗按此面重开(EH0012 族→stop-and-report)。
 # TP3 已被架构面封死(AR heads=16,16%3≠0,vLLM VllmConfig 硬拒)——放置结论入 012。
 # FP16-only:top-level dtype 显式 float16(310P 不变量;diffusion patch 另有 od_config 强制兜底)
 pipeline: ming_image
@@ -18,7 +19,7 @@ stages:
     enforce_eager: true
     tensor_parallel_size: 1
     pipeline_parallel_size: 2
-    devices: "2,3"
+    devices: "0,1"
     gpu_memory_utilization: 0.55
     max_num_seqs: 1
     output_connectors:
@@ -35,7 +36,7 @@ stages:
     cache_backend:
     cache_config:
     tensor_parallel_size: 1
-    devices: "1"
+    devices: "2"
     max_num_seqs: 1
     input_connectors:
       from_stage_0: shared_memory_connector
