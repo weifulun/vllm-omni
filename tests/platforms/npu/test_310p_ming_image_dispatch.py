@@ -209,7 +209,7 @@ class TestPlacementSurface:
         assert stage0["tensor_parallel_size"] == 1
         assert stage0["pipeline_parallel_size"] == 2
         devs = _split_devices(stage0["devices"])
-        assert devs == ["0", "1"]
+        assert devs == ["2", "3"]
         assert len(devs) == _world_size(stage0)
 
     def test_stage1_tp1_single_device(self) -> None:
@@ -218,7 +218,7 @@ class TestPlacementSurface:
         assert stage1["tensor_parallel_size"] == 1
         assert "pipeline_parallel_size" not in stage1
         devs = _split_devices(stage1["devices"])
-        assert devs == ["2"]
+        assert devs == ["1"]
         assert len(devs) == _world_size(stage1)
 
     def test_stages_disjoint_devices(self) -> None:
