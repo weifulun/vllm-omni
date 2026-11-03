@@ -1611,7 +1611,16 @@ class OmniDiffusionConfig:
             tf_config_dict = get_hf_file_to_dict("unet/config.json", self.model, revision=self.revision)
         if tf_config_dict is None:
             return False
-        self.set_tf_model_config(TransformerConfig.from_dict(tf_config_dict))
+        tf_config = TransformerConfig.from_dict(tf_config_dict)
+        # Preserve the vendor pipeline marker (e.g. Ming-Image Design's
+        # transformer/config.json "_class_name") for checkpoint-variant
+        # validation; from_dict only keeps known fields.
+        if isinstance(tf_config_dict, dict):
+            try:
+                tf_config._class_name = tf_config_dict.get("_class_name")
+            except Exception:  # frozen/strict config objects
+                pass
+        self.set_tf_model_config(tf_config)
         return True
 
     @staticmethod
@@ -1785,8 +1794,19 @@ class OmniDiffusionConfig:
                     # Ming-flash-omni-2.0 — imagegen stage uses the custom
                     # ``MingImagePipeline`` (ZImage DiT + Qwen2 connector). See
                     # vllm_omni/diffusion/models/ming_flash_omni/pipeline_ming_imagegen.py.
-                    self.model_class_name = "MingImagePipeline"
-                    self.tf_model_config = TransformerConfig()
+                    if _looks_like_ming_image_design(self.model):
+                        # Ming-Image Design (AR wrapper + transformer/ + mlp/
+                        # subfolders): the legacy MingImagePipeline inherits
+                        # ZImagePipeline and loads the generic
+                        # DistributedAutoencoderKL, which shape-asserts against
+                        # the vendor AutoencoderKLQwenImage VAE.  Route to the
+                        # Design pipeline and load its component DiT config.
+                        self.model_class_name = "MingImageDiffusionPipeline"
+                        if not self._load_component_transformer_config():
+                            self.set_tf_model_config(TransformerConfig())
+                    else:
+                        self.model_class_name = "MingImagePipeline"
+                        self.tf_model_config = TransformerConfig()
                     self.update_multimodal_support()
                 elif model_type == "nextstep":
                     if self.model_class_name is None:

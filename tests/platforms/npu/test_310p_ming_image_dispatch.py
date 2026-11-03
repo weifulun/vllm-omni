@@ -26,13 +26,16 @@ import pytest
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
 
-def _load_data_module() -> types.ModuleType:
+def _load_data_module(monkeypatch) -> types.ModuleType:
     spec = importlib.util.spec_from_file_location(
         "_310p_test_data_module",
         _REPO_ROOT / "vllm_omni" / "diffusion" / "data.py",
     )
     module = importlib.util.module_from_spec(spec)
     assert spec is not None and spec.loader is not None
+    # Register before exec: data.py has top-level @dataclass decorators whose
+    # resolution path does sys.modules[cls.__module__].
+    monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
     return module
 
@@ -41,7 +44,7 @@ def _load_data_module() -> types.ModuleType:
 def data_module(monkeypatch) -> types.ModuleType:
     # Isolate the module namespace so repeated loads are deterministic.
     monkeypatch.syspath_prepend(str(_REPO_ROOT))
-    return _load_data_module()
+    return _load_data_module(monkeypatch)
 
 
 def _write_config(path: Path, payload: dict) -> None:
@@ -114,3 +117,52 @@ class TestResolveModelClassName:
 
     def test_empty_model_returns_none(self, data_module) -> None:
         assert data_module.resolve_model_class_name("") is None
+
+
+class TestEnrichConfigDispatch:
+    """enrich_config must not clobber Design dispatch (second defect site).
+
+    The resolver-level fix alone is not enough: OmniDiffusionConfig.enrich_config
+    has an inline BailingMM2 mapping that unconditionally overwrote
+    model_class_name with the legacy MingImagePipeline.  These tests drive the
+    real enrich path on fake checkpoint layouts (no NPU, no GPU).
+    """
+
+    def _enrich(self, data_module, model_path: Path):
+        cfg = data_module.OmniDiffusionConfig(
+            model=str(model_path),
+            model_class_name=None,
+            diffusion_load_format="default",
+        )
+        cfg.enrich_config()
+        return cfg
+
+    def test_design_layout_enrich_routes_design_pipeline(
+        self, data_module, tmp_path: Path
+    ) -> None:
+        _design_layout(tmp_path)
+        cfg = self._enrich(data_module, tmp_path)
+        assert cfg.model_class_name == "MingImageDiffusionPipeline"
+        # Component DiT config must carry the vendor _class_name marker so
+        # _validate_variant_config can confirm the Design variant.
+        assert cfg.tf_model_config is not None
+        assert getattr(cfg.tf_model_config, "_class_name", None) == "DiffusionTransformer"
+
+    def test_design_layout_enrich_keeps_explicit_class(
+        self, data_module, tmp_path: Path
+    ) -> None:
+        _design_layout(tmp_path)
+        cfg = data_module.OmniDiffusionConfig(
+            model=str(tmp_path),
+            model_class_name="MingImageDiffusionPipeline",
+            diffusion_load_format="default",
+        )
+        cfg.enrich_config()
+        assert cfg.model_class_name == "MingImageDiffusionPipeline"
+
+    def test_legacy_layout_enrich_routes_legacy_pipeline(
+        self, data_module, tmp_path: Path
+    ) -> None:
+        _legacy_layout(tmp_path)
+        cfg = self._enrich(data_module, tmp_path)
+        assert cfg.model_class_name == "MingImagePipeline"
