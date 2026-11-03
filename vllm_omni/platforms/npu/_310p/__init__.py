@@ -38,6 +38,16 @@ def is_310p(device: torch.device | None = None) -> bool:
 
         return get_ascend_device_type() == AscendDeviceType._310P
     except Exception:
+        pass
+    # API drift (GATE-TP2 stack item, task-12 aee740b99/5a5a49692 lineage):
+    # some vllm-ascend builds expose the detector under
+    # vllm_ascend.device.device_config instead of vllm_ascend.utils; without
+    # this fallback the whole 310P patch stack no-ops silently.
+    try:
+        from vllm_ascend.device.device_config import is_310p as ascend_is_310p_cfg
+
+        return bool(ascend_is_310p_cfg())
+    except Exception:
         return False
 
 
