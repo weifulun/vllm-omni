@@ -282,6 +282,7 @@ def _install_pipeline_patches() -> None:
     TimestepEmbedder.timestep_embedding = _timestep_embedding_310p
 
     _PIPELINE_PATCHED = True
+    _maybe_install_actmax_probe()
     logger.info(
         "310P: HiDreamO1 pipeline patched (fp16 gate, CPU flow-matching "
         "scheduler, CPU RoPE table, CPU timestep features)"
@@ -580,3 +581,73 @@ def apply_diffusion_310p_patches(od_config: Any) -> None:
     if os.environ.get("VLLM_OMNI_310P_HIDREAM_FP16_SOFTMAX", "0") == "1":
         _install_fp16_softmax_swap()
     _log_placement_plan(od_config)
+
+def _maybe_install_actmax_probe() -> None:
+    """Container-only diagnostic (never on branch): track max |activation|
+    per transformer block for the first few denoising steps to hunt
+    fp16 65504-range overflow candidates.  Gated by
+    VLLM_OMNI_ACTMAX_PROBE=1."""
+    import os
+
+    if os.environ.get("VLLM_OMNI_ACTMAX_PROBE") != "1":
+        return
+    import torch
+
+    from vllm_omni.diffusion.models.hidream_o1_image.hidream_o1_image_transformer import (
+        HiDreamO1ImageTransformer,
+    )
+
+    state = {"armed": False, "fwd": 0}
+    MAX_FWD = 10  # 5 denoising steps x 2 CFG forwards
+
+    def _block_hook(idx, module, inp, out):
+        try:
+            v = out if isinstance(out, torch.Tensor) else out[0]
+            with torch.no_grad():
+                m = v.abs().max().item()
+            nan = bool(torch.isnan(v).any().item())
+            print(f"[ACTMAX] fwd={state[chr(34)+chr(34)] if False else state[chr(102)+chr(119)+chr(100)]} block={idx} maxabs={m:.4f} nan={nan}", flush=True)
+        except Exception as e:  # probe must never break the run
+            print(f"[ACTMAX] hook error: {e!r}", flush=True)
+
+    def _probe_forward(orig, self, *a, **kw):
+        if state["armed"]:
+            return orig(self, *a, **kw)
+        layers = list(self.model.language_model.layers)
+        for i, b in enumerate(layers):
+            b.register_forward_hook(_block_hook_curry(i))
+        state["armed"] = True
+        print(f"[ACTMAX] probe armed on {len(layers)} blocks, MAX_FWD={MAX_FWD}", flush=True)
+        out = orig(self, *a, **kw)
+        state["fwd"] += 1
+        if isinstance(out, (tuple, list)):
+            with torch.no_grad():
+                print(f"[ACTMAX] fwd={state[chr(102)+chr(119)+chr(100)]} x_pred maxabs={out[0].abs().max().item():.4f}", flush=True)
+        elif hasattr(out, "x_pred"):
+            with torch.no_grad():
+                print(f"[ACTMAX] fwd={state[chr(102)+chr(119)+chr(100)]} x_pred maxabs={out.x_pred.abs().max().item():.4f}", flush=True)
+        if state["fwd"] >= MAX_FWD:
+            for i, b in enumerate(layers):
+                b._forward_hooks and None
+            state["armed"] = False
+            for b in layers:
+                b._forward_hooks = {}
+            print("[ACTMAX] probe disarmed (MAX_FWD reached)", flush=True)
+        return out
+
+    def _block_hook_curry(idx):
+        def _h(module, inp, out):
+            if not state["armed"]:
+                return
+            try:
+                v = out if isinstance(out, torch.Tensor) else out[0]
+                with torch.no_grad():
+                    m = v.abs().max().item()
+                nan = bool(v.isnan().any().item())
+                print(f"[ACTMAX] fwd={state[chr(102)+chr(119)+chr(100)]} block={idx} maxabs={m:.4f} nan={nan}", flush=True)
+            except Exception as e:
+                print(f"[ACTMAX] hook error: {e!r}", flush=True)
+        return _h
+
+    orig = HiDreamO1ImageTransformer.forward
+    HiDreamO1ImageTransformer.forward = lambda self, *a, **kw: _probe_forward(orig, self, *a, **kw)
