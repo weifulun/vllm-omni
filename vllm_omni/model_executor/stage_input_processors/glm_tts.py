@@ -72,6 +72,25 @@ def _build_voice_clone_embed_struct(payload: dict[str, Any]) -> EmbeddingsStruct
 # ---------------------------------------------------------------------------
 
 
+def _client_dit_seed(model_intermediate_buffer: Any) -> int | None:
+    """task-39 seed-discipline: client per-request DiT seed (meta.seed).
+
+    The offline e2e / serve clients opt in to determinism by setting
+    ``model_intermediate_buffer={"meta": {"seed": N}}`` on the request.
+    Without forwarding here, the seed dies at the AR->DiT stage boundary
+    and the engine-side per-request generator injection sees None.
+    """
+    if not isinstance(model_intermediate_buffer, dict):
+        return None
+    meta = model_intermediate_buffer.get("meta")
+    if isinstance(meta, dict) and meta.get("seed") is not None:
+        try:
+            return int(meta["seed"])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
 def ar_to_dit(
     source_outputs: list[Any],
     prompt: Any = None,
@@ -136,6 +155,18 @@ def ar_to_dit(
                 "block_pattern": [n_tokens],
             }
         }
+
+        # task-39 seed-discipline: forward the client's per-request DiT seed
+        # (model_intermediate_buffer.meta.seed) into the DiT-stage meta so the
+        # engine-side per-request generator injection can consume it.
+        _client_mib = (
+            prompt.get("model_intermediate_buffer")
+            if isinstance(prompt, dict)
+            else getattr(prompt, "model_intermediate_buffer", None)
+        )
+        _dit_seed = _client_dit_seed(_client_mib)
+        if _dit_seed is not None:
+            additional_info["meta"]["seed"] = _dit_seed
 
         dit_inputs.append(
             OmniTokensPrompt(
@@ -215,6 +246,10 @@ def ar_to_dit_async_chunk(
     request_id = getattr(request, "external_req_id", None) or getattr(request, "request_id", None)
     if request_id is None:
         raise ValueError("GLM-TTS async chunk request is missing request id")
+    # task-39 seed-discipline: client per-request DiT seed for streaming chunks.
+    client_dit_seed = _client_dit_seed(
+        getattr(request, "model_intermediate_buffer", None)
+    )
     finished = bool(is_finished or request.is_finished())
     pooling_output = multimodal_output
 
@@ -298,6 +333,7 @@ def ar_to_dit_async_chunk(
                 stream_finished=torch.tensor(is_terminal, dtype=torch.bool),
                 req_id=[request_id],
                 left_context_size=tok_offset,
+                audio_seed=client_dit_seed,
             ),
             kv_metadata={
                 _GLM_TTS_PRIVATE_KEY: {

@@ -436,10 +436,20 @@ class GLMTTSDiTForGeneration(nn.Module):
             # task-39 seed-discipline: per-request DiT seed via the existing
             # model_intermediate_buffer copy channel (meta.seed, opt-in).
             _seed_raw = nested_get(info, "meta", "seed") if info else None
+            if _seed_raw is None:
+                # MetaStruct (async chunk path) carries the client seed in the
+                # schema-declared audio_seed field; the sync processor path
+                # forwards the plain-dict meta.seed.
+                _seed_raw = nested_get(info, "meta", "audio_seed") if info else None
             try:
                 seed = int(_seed_raw) if _seed_raw is not None else None
             except (TypeError, ValueError):
                 seed = None
+            # task-39 diagnostic (channel verify, seed 43 probe):
+            logger.info(
+                "[seed-chan] req_id=%s info_keys=%s meta_seed_raw=%r -> seed=%s",
+                req_id, sorted(info.keys()) if info else None, _seed_raw, seed,
+            )
             if req_id is not None:
                 with self._stream_cache_lock:
                     self._stream_last_seen[req_id] = self._stream_forward_count
