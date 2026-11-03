@@ -363,8 +363,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--tensor-parallel-size",
         type=int,
-        default=1,
-        help="Number of GPUs used for tensor parallelism (TP) inside the DiT.",
+        default=None,
+        help="Number of GPUs used for tensor parallelism (TP) inside the DiT. "
+        "None = take the per-stage value from the deploy config.",
     )
     parser.add_argument(
         "--enable-expert-parallel",
@@ -609,13 +610,14 @@ def main():
         ulysses_degree=args.ulysses_degree,
         ring_degree=args.ring_degree,
         cfg_parallel_size=args.cfg_parallel_size,
-        tensor_parallel_size=args.tensor_parallel_size,
         enable_expert_parallel=args.enable_expert_parallel,
         enable_cpu_offload=args.enable_cpu_offload,
         enable_diffusion_pipeline_profiler=args.enable_diffusion_pipeline_profiler,
         profiler_config=args.profiler_config,
         init_timeout=args.init_timeout,
     )
+    if args.tensor_parallel_size is not None:
+        omni_kwargs["tensor_parallel_size"] = args.tensor_parallel_size
     if args.enforce_eager is not None:
         omni_kwargs["enforce_eager"] = args.enforce_eager
     if args.trust_remote_code:
