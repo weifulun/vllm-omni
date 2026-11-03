@@ -1,0 +1,68 @@
+# MiniMax H3 on Ascend 310P, node 128, C1+C2 (4 chips visible 0-3) — FP16 route.
+# RULING-A-GATE ④B fallback line: the 310P CANN 9.1.0 build rejects the W8A8
+# runtime matmul (aclnnQuantMatmulV5 -> 161002, parameter-independent sweep),
+# so the INT8 line (POLICY §2 tier-2) cannot produce a forward on 310P in
+# this build. POLICY §2 tier-1 = FP16 placement:
+# * stage 0 (Qwen3-VL-32B AR encoder) FP16 TP4: 66.7 GB / 4 = ~16.7 GB/chip
+#   + CANN baseline ~1.2 GB + KV pool -> fits the 21.6 GB chip budget; if the
+#   KV margin is tight at e2e time, enable_cpu_offload: true (vLLM-native AR
+#   host offload; the vllm-omni llm_ar LWO knob is NOT the mechanism — config
+#   ownership rejects it, measured).
+# * stage 1 (33.1B DiT) FP16 TP4: ~66.2 GB / 4 = 16.6 GB/chip, no DLO needed
+#   (headroom for the ~1.6 GB attention slab).
+# * stage 2 VAE tiled on the same 4 chips.
+# dtype float16 pinned at serve time; attention TORCH_SDPA math fallback;
+# ulysses_degree 1. Same pipeline as the 310P INT8 line.
+pipeline: minimax_h3_disaggregated_decode
+async_chunk: false
+trust_remote_code: true
+distributed_executor_backend: mp
+stages:
+  - stage_id: 0
+    devices: "0,1,2,3"
+    tensor_parallel_size: 4
+    gpu_memory_utilization: 0.90
+    max_model_len: 8192
+    max_num_seqs: 1
+    max_num_batched_tokens: 2048
+    enforce_eager: true
+    model: /models/FL2VA/text_encoder
+    hf_overrides:
+      minimax_h3_encoder_components:
+        text_encoder:
+          parallel_mode: tp
+        video_vae:
+          parallel_mode: patch
+        audio_vae:
+          parallel_mode: leader
+    default_sampling_params:
+      detokenize: false
+      max_tokens: 1
+      temperature: 0.0
+  - stage_id: 1
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    model_loaded:
+      text_encoder: false
+      vae_encoder: false
+      vae_decoder: false
+    parallel_config:
+      tensor_parallel_size: 4
+      ulysses_degree: 1
+      vae_patch_parallel_size: 1
+    default_sampling_params:
+      num_inference_steps: 50
+      seed: 42
+  - stage_id: 2
+    devices: "0,1,2,3"
+    max_num_seqs: 1
+    enforce_eager: true
+    parallel_config:
+      tensor_parallel_size: 4
+      ulysses_degree: 1
+      vae_patch_parallel_size: 2
+      vae_parallel_mode: tile
+    vae_use_tiling: true
+    default_sampling_params:
+      seed: 42
