@@ -56,6 +56,38 @@ def _load_dispatcher(name: str = "covo_dispatch_under_test"):
     )
 
 
+def _install_fake_rotary_embedding(monkeypatch: pytest.MonkeyPatch):
+    """Fake vllm_ascend._310p.ops.rotary_embedding with a recording orig."""
+    calls = {"update": 0, "forward": 0}
+
+    def update_cos_sin(positions):
+        calls["update"] += 1
+
+    def orig_rope(self, positions, query, key, is_neox_style, offsets=None):
+        calls["forward"] += 1
+        return query, key
+
+    mod = types.ModuleType("vllm_ascend._310p.ops.rotary_embedding")
+    mod.update_cos_sin = update_cos_sin
+    mod._rope_forward_oot = orig_rope
+
+    pkg_ascend = types.ModuleType("vllm_ascend")
+    pkg_ascend.__path__ = []
+    pkg_310 = types.ModuleType("vllm_ascend._310p")
+    pkg_310.__path__ = []
+    pkg_ops = types.ModuleType("vllm_ascend._310p.ops")
+    pkg_ops.__path__ = []
+    pkg_ascend._310p = pkg_310
+    pkg_310.ops = pkg_ops
+    pkg_ops.rotary_embedding = mod
+
+    monkeypatch.setitem(sys.modules, "vllm_ascend", pkg_ascend)
+    monkeypatch.setitem(sys.modules, "vllm_ascend._310p", pkg_310)
+    monkeypatch.setitem(sys.modules, "vllm_ascend._310p.ops", pkg_ops)
+    monkeypatch.setitem(sys.modules, "vllm_ascend._310p.ops.rotary_embedding", mod)
+    return mod, calls
+
+
 def _install_fake_alias_free(monkeypatch: pytest.MonkeyPatch):
     """Fake common.alias_free_activation with a recording kaiser function."""
 
@@ -281,3 +313,49 @@ def test_apply_entry_point_gated_by_is_310p(monkeypatch):
     mod.apply_covo_audio_patches(SimpleNamespace())
     assert getattr(token2wav, "_omni_f", None) is None
     assert mod._STAGE1_PATCHED is False
+
+
+def test_stage0_installs_rope_cos_sin_refresh(monkeypatch):
+    """apply_stage0_patches must rewrap the OOT rope forward to refresh cos/sin.
+
+    The V1 runner never calls update_cos_sin (V2-only call site), so without
+    the refresh wrapper the head_size-128 branch of _rope_forward_oot passes
+    null cos/sin into npu_apply_rotary_pos_emb (CANN 161001, EZ1001).
+    """
+    fake_rot, calls = _install_fake_rotary_embedding(monkeypatch)
+    mod = _load_covo_patch()
+    cfg = SimpleNamespace(hf_config=SimpleNamespace(encoder_config=SimpleNamespace()))
+    mod.apply_stage0_patches(cfg)
+
+    wrapped = fake_rot._rope_forward_oot
+    assert getattr(wrapped, "_covo_310p_rope_refresh", False) is True
+    positions = torch.arange(16, dtype=torch.long)
+    wrapped(object(), positions, torch.ones(16, 8), torch.ones(16, 8), True)
+    assert calls["update"] == 1, "cos/sin storage must be refreshed before delegating"
+    assert calls["forward"] == 1
+
+    # Idempotency: a second apply (flag reset) must not double-wrap.
+    wrapped_before = fake_rot._rope_forward_oot
+    mod._STAGE0_PATCHED = False
+    mod.apply_stage0_patches(cfg)
+    assert fake_rot._rope_forward_oot is wrapped_before
+    wrapped(object(), positions, torch.ones(16, 8), torch.ones(16, 8), True)
+    assert calls["update"] == 2 and calls["forward"] == 2
+
+
+def test_rope_refresh_skips_update_when_drafting_flag_set(monkeypatch):
+    """The wrapper must not double-refresh when the runner already does."""
+    fake_rot, calls = _install_fake_rotary_embedding(monkeypatch)
+    mod = _load_covo_patch()
+    mod.apply_stage0_patches(
+        SimpleNamespace(hf_config=SimpleNamespace(encoder_config=SimpleNamespace()))
+    )
+
+    class _DraftingRotary:
+        _is_drafting_update_enabled = True
+
+    wrapped = fake_rot._rope_forward_oot
+    positions = torch.arange(8, dtype=torch.long)
+    wrapped(_DraftingRotary(), positions, torch.ones(8, 4), torch.ones(8, 4), False)
+    assert calls["update"] == 0, "drafting path already refreshes cos/sin"
+    assert calls["forward"] == 1

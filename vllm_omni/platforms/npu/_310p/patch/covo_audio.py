@@ -15,6 +15,15 @@ Stage 0 (fused_thinker_talker, LLM_AR):
     dispatcher rejects globally (research/012, 7th+ confirmations on this
     image).  The Qwen2 LLM part runs on vLLM's native AR engine
     (vllm-ascend backend) and is untouched.
+  * OOT rope cos/sin refresh: the 310P out-of-tree rotary reads the cos/sin
+    pair from module-global stable storage that only ``update_cos_sin``
+    fills; on 310P that refresh is wired into the V2 model runner only, so
+    under the V1 runner (the one every 310P AR line currently uses) the
+    storage stays None and the head_size-128 branch of
+    ``_rope_forward_oot`` calls ``npu_apply_rotary_pos_emb(q, k, None,
+    None)`` -> CANN 161001 "Check cos != nullptr failed".  The module-global
+    ``_rope_forward_oot`` is rewrapped (runtime module-attr rebind) to
+    refresh the storage from the recorded cos/sin cache on every forward.
   * dtype: the overlay (``deploy/covo_audio_310p.yaml``) pins the engine
     dtype to float16 at construction time (310P is FP16-only; the upstream
     checkpoint is bf16 storage).  The loader materializes disk-bf16 weights
@@ -151,11 +160,52 @@ class _FShim:
 # ---------------------------------------------------------------------------
 
 
+def _patch_rope_cos_sin_refresh_for_310p() -> None:
+    """Refresh the OOT rope cos/sin slices on every forward (V1 runner gap).
+
+    ``vllm_ascend._310p.ops.rotary_embedding`` keeps the cos/sin pair in
+    module-global stable storage; ``update_cos_sin`` fills it, and the only
+    production call site is the V2 model runner
+    (``vllm_ascend._310p.worker.v2.model_runner``).  310P AR lines run the
+    V1 runner ("Model Runner V2 does not yet support 310P"), so the storage
+    is never filled and the head_size == 128 branch of
+    ``_rope_forward_oot`` passes null cos/sin into
+    ``npu_apply_rotary_pos_emb`` -> CANN 161001 AclNN_Parameter_Error(EZ1001)
+    "Check cos != nullptr failed".
+
+    Rewrap the module-global ``_rope_forward_oot`` (runtime module-attr
+    rebind; importing the symbol and reassigning locally would be a no-op by
+    the symbol-swap trap, research/012) so each forward refreshes the
+    storage from the recorded cos/sin cache before delegating.  The refresh
+    is skipped when the drafting flag is set (the spec-decode proposers
+    toggle it around their own refresh).
+    """
+    try:
+        from vllm_ascend._310p.ops import rotary_embedding as _rm
+    except Exception:  # bare host without vllm_ascend (contract tests)
+        _log("stage0: vllm_ascend._310p.ops.rotary_embedding unavailable; rope refresh skipped")
+        return
+
+    orig = _rm._rope_forward_oot
+    if getattr(orig, "_covo_310p_rope_refresh", False):
+        return  # already wrapped (idempotency)
+
+    def _rope_forward_oot_refresh(self, positions, query, key, is_neox_style, offsets=None):
+        if offsets is None and not getattr(type(self), "_is_drafting_update_enabled", False):
+            _rm.update_cos_sin(positions)
+        return orig(self, positions, query, key, is_neox_style, offsets)
+
+    _rope_forward_oot_refresh._covo_310p_rope_refresh = True  # type: ignore[attr-defined]
+    _rm._rope_forward_oot = _rope_forward_oot_refresh
+    _log("stage0: OOT rope cos/sin per-forward refresh installed (V1 runner gap)")
+
+
 def apply_stage0_patches(model_config) -> None:
-    """Force the Whisper encoder onto the eager (math) attention path."""
+    """Stage 0 pins: OOT rope cos/sin refresh + Whisper encoder eager path."""
     global _STAGE0_PATCHED
     if _STAGE0_PATCHED or _patches_disabled():
         return
+    _patch_rope_cos_sin_refresh_for_310p()
     hf_config = getattr(model_config, "hf_config", None)
     if hf_config is None:
         return
@@ -164,7 +214,7 @@ def apply_stage0_patches(model_config) -> None:
         return  # nothing to pin; leave the flag unset
     encoder_config._attn_implementation = "eager"
     _STAGE0_PATCHED = True
-    _log("stage0: whisper encoder _attn_implementation -> eager")
+    _log("stage0: OOT rope cos/sin refresh + whisper encoder _attn_implementation -> eager")
 
 
 # ---------------------------------------------------------------------------
