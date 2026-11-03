@@ -5,6 +5,7 @@
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import math
 import os
@@ -40,6 +41,7 @@ class _StreamRequestState:
     prompt_payload: dict[str, torch.Tensor] = dataclasses.field(default_factory=dict)
     audio_tail: torch.Tensor | None = None
     wav_pointer: int = 0
+    block_count: int = 0
     fade_tail: torch.Tensor | None = None
 
 
@@ -235,6 +237,25 @@ def split_request_ids(ids: torch.Tensor, seq_token_counts: list[int] | None = No
     return [ids]
 
 
+_GLM_TTS_SEED_PERSON = b"glm-tts-dit"
+_GLM_TTS_SEED_BYTES = 8
+
+
+def _derive_seed(seed: int, *parts: object) -> int:
+    """Derive a stable 63-bit sub-seed from a request seed and labels.
+
+    Same construction as minimax_music3/acoustic.py::_derive_seed (stable
+    multi-part derivation; no uuid/time sources). task-39 seed-discipline fix.
+    """
+    digest = hashlib.blake2b(digest_size=_GLM_TTS_SEED_BYTES, person=_GLM_TTS_SEED_PERSON)
+    digest.update(int(seed).to_bytes(8, "little", signed=False))
+    for part in parts:
+        raw = str(part).encode("utf-8")
+        digest.update(len(raw).to_bytes(4, "little"))
+        digest.update(raw)
+    return int.from_bytes(digest.digest(), "little") & ((1 << 63) - 1)
+
+
 class GLMTTSDiTForGeneration(nn.Module):
     """GLM-TTS DiT flow-matching stage wrapped as LLM_GENERATION."""
 
@@ -412,6 +433,13 @@ class GLMTTSDiTForGeneration(nn.Module):
         for idx, req_ids in enumerate(request_ids_list):
             info = runtime_info[idx] if idx < len(runtime_info) and isinstance(runtime_info[idx], dict) else {}
             req_id = as_str(nested_get(info, "meta", "req_id")) if info else None
+            # task-39 seed-discipline: per-request DiT seed via the existing
+            # model_intermediate_buffer copy channel (meta.seed, opt-in).
+            _seed_raw = nested_get(info, "meta", "seed") if info else None
+            try:
+                seed = int(_seed_raw) if _seed_raw is not None else None
+            except (TypeError, ValueError):
+                seed = None
             if req_id is not None:
                 with self._stream_cache_lock:
                     self._stream_last_seen[req_id] = self._stream_forward_count
@@ -661,6 +689,15 @@ class GLMTTSDiTForGeneration(nn.Module):
             override_mel = max(0, stable_mel_len - lookahead_mel_len)
             stream_cache_len = min(feat_len, prompt_feat_len + override_mel + 1)
 
+        # task-39: streaming block order feeds the per-block seed derivation
+        # (non-streaming stays block_idx=0).
+        dit_block_idx = 0
+        if is_streaming and seed is not None and req_id is not None:
+            with self._stream_cache_lock:
+                _rs_idx = self._stream_state_by_req.get(req_id)
+                if _rs_idx is not None:
+                    dit_block_idx = _rs_idx.block_count
+                    _rs_idx.block_count += 1
         mel, current_step_cache = self._do_sample(
             speech_tokens=speech_tokens,
             mel_cond=mel_cond,
@@ -672,6 +709,8 @@ class GLMTTSDiTForGeneration(nn.Module):
             block_pattern=dit_block_pattern,
             cache_len=stream_cache_len,
             text_lens=text_lens,
+            seed=seed,
+            block_idx=dit_block_idx,
         )
 
         if req_id is not None:
@@ -811,6 +850,8 @@ class GLMTTSDiTForGeneration(nn.Module):
         block_pattern: list[int] | None = None,
         cache_len: int | None = None,
         text_lens: torch.Tensor | None = None,
+        seed: int | None = None,
+        block_idx: int = 0,
     ) -> tuple[torch.Tensor, dict[int | str, Any]]:
         """Euler ODE sampling for flow matching."""
         # CUDA graph path: the captured graph does NOT pass is_causal /
@@ -819,7 +860,10 @@ class GLMTTSDiTForGeneration(nn.Module):
         # wrong for streaming where block-causal attention is required.
         # Skip the graph when block_pattern is set so we fall through to the
         # eager path that correctly forwards these arguments.
-        use_cudagraph = block_pattern is None
+        # G1 (task-39): with a per-request seed the captured graph cannot be
+        # used — its randn node bakes the RNG at capture time.  Without a
+        # seed the graph path behaves verbatim as before.
+        use_cudagraph = block_pattern is None and seed is None
         graph_result = (
             self._try_cudagraph_sample(
                 speech_tokens=speech_tokens,
@@ -842,7 +886,19 @@ class GLMTTSDiTForGeneration(nn.Module):
         # Always accumulate the Euler ODE state in float32 regardless of the
         # DiT model dtype.  Half-precision rounding errors across 10 steps (×2
         # CFG passes each) manifest as audible hiss on H20/H100.
-        x = torch.randn(mel_cond.shape, device=device, dtype=torch.float32)
+        # task-39 seed-discipline: per-request generator injection at the
+        # single noise origin.  No seed -> global-RNG semantics preserved
+        # verbatim (zero behavior change for other lines/requests).
+        gen = (
+            torch.Generator(device=device).manual_seed(
+                _derive_seed(seed, "dit", block_idx)
+            )
+            if seed is not None
+            else None
+        )
+        x = torch.randn(
+            mel_cond.shape, device=device, dtype=torch.float32, generator=gen
+        )
         # Cast conditioning tensors to float32 for the ODE loop.
         condition_f32 = condition.to(torch.float32)
         spkr_embedding_f32 = spkr_embedding.to(torch.float32) if spkr_embedding is not None else None
