@@ -166,3 +166,57 @@ class TestEnrichConfigDispatch:
         _legacy_layout(tmp_path)
         cfg = self._enrich(data_module, tmp_path)
         assert cfg.model_class_name == "MingImagePipeline"
+
+
+# ---------------------------------------------------------------------------
+# Placement surface (recipe A' = TP3 AR + TP1 DiT, lead O1 ruling 11-03).
+# Fakes-first: parses the vendored staging yaml snapshot; no device contact.
+# Keep in sync with agents/model-mingimage/mingimage-310p.yaml (diff at stage).
+# ---------------------------------------------------------------------------
+
+def _load_recipe_fixture() -> dict:
+    import yaml
+
+    here = Path(__file__).resolve().parent
+    with open(here / "fixtures" / "mingimage-310p.yaml", encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+def _split_devices(raw: object) -> list[str]:
+    assert isinstance(raw, str) and raw, f"devices must be a csv string, got {raw!r}"
+    return [tok.strip() for tok in raw.split(",") if tok.strip()]
+
+
+class TestPlacementSurface:
+    def test_stage0_tp3_devices_consistent(self) -> None:
+        stages = _load_recipe_fixture()["stages"]
+        stage0 = stages[0]
+        assert stage0["tensor_parallel_size"] == 3
+        devs = _split_devices(stage0["devices"])
+        assert devs == ["0", "1", "3"]
+        assert len(devs) == stage0["tensor_parallel_size"]
+
+    def test_stage1_tp1_single_device(self) -> None:
+        stages = _load_recipe_fixture()["stages"]
+        stage1 = stages[1]
+        assert stage1["tensor_parallel_size"] == 1
+        devs = _split_devices(stage1["devices"])
+        assert devs == ["2"]
+        assert len(devs) == stage1["tensor_parallel_size"]
+
+    def test_stages_disjoint_devices(self) -> None:
+        stages = _load_recipe_fixture()["stages"]
+        dev_sets = [set(_split_devices(s["devices"])) for s in stages]
+        for i, j in ((0, 1),):
+            assert dev_sets[i].isdisjoint(dev_sets[j])
+
+    def test_fp16_invariant_and_probe_surface(self) -> None:
+        doc = _load_recipe_fixture()
+        assert doc["dtype"] == "float16"
+        stage0 = doc["stages"][0]
+        assert stage0["default_sampling_params"] == {
+            "max_tokens": 1,
+            "temperature": 0,
+            "seed": 42,
+        }
+        assert stage0["enforce_eager"] is True
