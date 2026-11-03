@@ -186,6 +186,14 @@ _DIFFUSION_MODELS = {
         "pipeline_wan2_2_i2v",
         "WanI2VDMD2Pipeline",
     ),
+    # Wan-Dancer-14B twin DiT (task-40): two-stage music-driven dance/motion
+    # generation. Runner-driven construction (WanDancerPipeline.from_repo); the
+    # 310P patch module is registered in _310p.patch under the same arch name.
+    "WanDancerPipeline": (
+        "wan2_2",
+        "pipeline_wan_dancer",
+        "WanDancerPipeline",
+    ),
     "LingBotWorldCausalDMDPipeline": (
         "lingbot_world",
         "pipeline",

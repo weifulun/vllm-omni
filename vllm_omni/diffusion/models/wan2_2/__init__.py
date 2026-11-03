@@ -29,6 +29,7 @@ from .pipeline_wan2_2_vace import (
     get_wan22_vace_post_process_func,
     get_wan22_vace_pre_process_func,
 )
+from .pipeline_wan_dancer import WanDancerPipeline
 from .wan2_2_transformer import WanTransformer3DModel
 from .wan2_2_vace_transformer import VaceWanTransformerBlock, WanVACETransformer3DModel
 
