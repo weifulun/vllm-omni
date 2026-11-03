@@ -180,8 +180,12 @@ def _patch_vocoder_cpu_pin() -> None:
 def _patch_speech_tokenizer_cpu_pin() -> None:
     """Pin the WhisperVQ speech tokenizer + force float32 on 310P."""
     from vllm_omni.model_executor.models.glm_tts import voice_clone as _vc
+    import vllm_omni.model_executor.models.glm_tts.glm_tts as _gm
 
     if getattr(_vc.load_voice_clone_frontend, "_310p_cpu_pinned", False):
+        # Already wrapped — still make sure the glm_tts namespace (import
+        # binding) points at the wrapper.
+        _gm.load_voice_clone_frontend = _vc.load_voice_clone_frontend  # type: ignore[assignment]
         return
 
     orig = _vc.load_voice_clone_frontend
@@ -214,6 +218,15 @@ def _patch_speech_tokenizer_cpu_pin() -> None:
     _load_voice_clone_frontend_310p._310p_cpu_pinned = True  # type: ignore[attr-defined]
     _vc.load_voice_clone_frontend = _load_voice_clone_frontend_310p  # type: ignore[assignment]
     _vc.load_voice_clone_frontend._310p_orig = orig  # type: ignore[attr-defined]
+    # glm_tts.py binds the name at import time (``from .voice_clone import
+    # load_voice_clone_frontend``) — the mm-processor path (main process)
+    # resolves through that namespace, so both must be rebound.
+    import vllm_omni.model_executor.models.glm_tts.glm_tts as _gm
+
+    if not getattr(
+        getattr(_gm, "load_voice_clone_frontend", None), "_310p_cpu_pinned", False
+    ):
+        _gm.load_voice_clone_frontend = _load_voice_clone_frontend_310p  # type: ignore[assignment]
 
 
 def _patch_logits_nan_guard() -> None:
@@ -236,6 +249,126 @@ def _patch_logits_nan_guard() -> None:
     cls.compute_logits = _compute_logits_310p  # type: ignore[assignment]
     cls._310p_nan_guarded = True  # type: ignore[attr-defined]
     cls._310p_orig_compute_logits = orig  # type: ignore[attr-defined]
+
+
+def _patch_torch_nan_to_num_device_safe() -> None:
+    """Make ``torch.nan_to_num`` AclNN-safe on NPU tensors.
+
+    310P does not implement ``aclnnNanToNum`` (EZ1001 ``NanToNum is not
+    supported on this device``).  Upstream GLM-TTS decode paths call
+    ``torch.nan_to_num`` on-device -- RAS nucleus sampling
+    (``nucleus_ras_sampling.py``) and the AR logits guard below.
+
+    The replacement composes ``isfinite``/``where``/sign comparisons, all
+    AclNN-supported on 310P3 (probe-verified).  Note: ``== +/-inf`` is
+    *broken* on 310P AclNN (always False), so inf classification is done
+    via the IEEE sign of non-finite values instead (NaN compares False to
+    both 0 tests, +inf is > 0, -inf is < 0).  CPU tensors keep the
+    original behavior.
+    """
+    orig = torch.nan_to_num
+    if getattr(orig, "_310p_nan_to_num_wrapped", False):
+        return
+
+    def _safe(
+        input: Any,
+        nan: float = 0.0,
+        posinf: float | None = None,
+        neginf: float | None = None,
+        *,
+        copy: bool = True,
+        inplace: bool = False,
+    ) -> Any:
+        if isinstance(input, torch.Tensor) and input.device.type == "npu" and not inplace:
+            finite = torch.isfinite(input)
+            if posinf is None:
+                posinf = float(torch.finfo(input.dtype).max)
+            if neginf is None:
+                neginf = float(torch.finfo(input.dtype).min)
+            nan_t = torch.tensor(float(nan), dtype=input.dtype, device=input.device)
+            pos_t = torch.tensor(float(posinf), dtype=input.dtype, device=input.device)
+            neg_t = torch.tensor(float(neginf), dtype=input.dtype, device=input.device)
+            return torch.where(
+                finite,
+                input,
+                torch.where(input > 0, pos_t, torch.where(input < 0, neg_t, nan_t)),
+            )
+        # Default copy/inplace semantics; forwarded kwargs only where the
+        # installed torch build accepts them (older torch has no `copy`).
+        kwargs = dict(nan=nan, posinf=posinf, neginf=neginf)
+        if inplace:
+            kwargs["inplace"] = True
+        try:
+            return orig(input, **kwargs)
+        except TypeError:
+            return orig(input, nan=nan, posinf=posinf, neginf=neginf)
+
+    _safe._310p_nan_to_num_wrapped = True  # type: ignore[attr-defined]
+    torch.nan_to_num = _safe  # type: ignore[assignment]
+
+
+def _patch_mel_extraction_cpu_pin() -> None:
+    """Run the mm-processor's mel extraction on CPU on 310P.
+
+    ``extract_prompt_feat`` feeds ``current_omni_platform.get_torch_device()``
+    (NPU) to the STFT-based mel path; ``torch.stft`` produces complex
+    tensors, which 310P AclNN cannot represent (ERR01007 ``Current settings
+    do not support Complex dtype``).  The mel feature is a preprocessing
+    artifact — the worker moves it to its own device at handoff.
+    """
+    from vllm_omni.model_executor.models.glm_tts import voice_clone as _vc
+    import vllm_omni.model_executor.models.glm_tts.glm_tts as _gm
+
+    if getattr(_vc.extract_prompt_feat, "_310p_cpu_pinned", False):
+        _gm.extract_prompt_feat = _vc.extract_prompt_feat  # type: ignore[assignment]
+        return
+
+    orig = _vc.extract_prompt_feat
+
+    def _extract_prompt_feat_310p(ref_audio_wav, ref_audio_sr, model_device, *args, **kwargs):
+        return orig(ref_audio_wav, ref_audio_sr, torch.device("cpu"), *args, **kwargs)
+
+    _extract_prompt_feat_310p._310p_cpu_pinned = True  # type: ignore[attr-defined]
+    _vc.extract_prompt_feat = _extract_prompt_feat_310p  # type: ignore[assignment]
+    _gm.extract_prompt_feat = _extract_prompt_feat_310p  # type: ignore[assignment]
+
+
+_PROCESS_SHIM_PATCHED = False
+
+
+def apply_glm_tts_process_shims() -> None:
+    """Install the process-wide GLM-TTS shims (310P only, every process).
+
+    The GLM-TTS mm-processor loads the WhisperVQ voice-clone frontend in
+    the orchestrator/main process — a place the worker-gated
+    ``apply_model_patches`` dispatch never reaches — where upstream pins
+    it to ``current_omni_platform.get_torch_device()`` (NPU).  The frontend
+    CPU pin and the device-safe ``torch.nan_to_num`` shim are
+    model-independent, so install them from the platform-level hook
+    (``NPUOmniPlatform.__init__`` runs in every vllm_omni process).
+    """
+    global _PROCESS_SHIM_PATCHED
+    if _PROCESS_SHIM_PATCHED:
+        return
+
+    from vllm_omni.platforms.npu._310p import is_310p
+
+    if not is_310p():
+        return
+    if _kill_switch_off():
+        import vllm
+
+        vllm.logger.init_logger(__name__).info(
+            "[310P][GLM-TTS] kill switch %s=0: process shims skipped",
+            _KILL_SWITCH_ENV,
+        )
+        _PROCESS_SHIM_PATCHED = True
+        return
+
+    _patch_torch_nan_to_num_device_safe()
+    _patch_speech_tokenizer_cpu_pin()
+    _patch_mel_extraction_cpu_pin()
+    _PROCESS_SHIM_PATCHED = True
 
 
 def apply_glm_tts_310p_patches() -> None:
@@ -266,6 +399,7 @@ def apply_glm_tts_310p_patches() -> None:
     _patch_dit_attention()
     _patch_vocoder_cpu_pin()
     _patch_speech_tokenizer_cpu_pin()
+    _patch_torch_nan_to_num_device_safe()
     _patch_logits_nan_guard()
     _PATCHED = True
 
@@ -273,5 +407,5 @@ def apply_glm_tts_310p_patches() -> None:
 
     vllm.logger.init_logger(__name__).info(
         "[310P][GLM-TTS] patch set installed: DiT math-SDPA, vocoder CPU pin, "
-        "WhisperVQ CPU+fp32 pin, AR logits NaN guard"
+        "WhisperVQ CPU+fp32 pin, NPU-safe torch.nan_to_num, AR logits NaN guard"
     )

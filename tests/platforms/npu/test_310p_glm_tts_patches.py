@@ -166,19 +166,29 @@ def _make_fake_stack(monkeypatch: pytest.MonkeyPatch, is_310p_value: bool):
         model = nn.Linear(4, 4, dtype=torch.float16)  # simulate fp16 checkpoint
         return (model, "FE"), "CAMPPLUS"
 
+    def extract_prompt_feat(ref_audio_wav, ref_audio_sr, model_device, *args, **kwargs):
+        vc_calls["feat_devices"].append(model_device)
+        return torch.zeros(4, 80, dtype=torch.float32, device=torch.device("cpu"))
+
     voice_mod = _install_fake_module(
         monkeypatch,
         "vllm_omni.model_executor.models.glm_tts.voice_clone",
         load_voice_clone_frontend=load_voice_clone_frontend,
+        extract_prompt_feat=extract_prompt_feat,
     )
     voice_mod._calls = vc_calls
+    vc_calls["feat_devices"] = []
 
+    # The real glm_tts.py binds ``load_voice_clone_frontend`` into its own
+    # namespace at import time — the fake must mirror that binding.
     model_mod = _install_fake_module(
         monkeypatch,
         "vllm_omni.model_executor.models.glm_tts.glm_tts",
         GLMTTSForConditionalGeneration=type(
             "GLMTTSForConditionalGeneration", (_BaseGLMTTS,), {}
         ),
+        load_voice_clone_frontend=load_voice_clone_frontend,
+        extract_prompt_feat=extract_prompt_feat,
     )
 
     pkg = _install_fake_module(
@@ -392,6 +402,82 @@ def test_logits_nan_guard_ar_only(monkeypatch):
     inst.model_stage = "glm_tts_dit"  # DiT stage passes through unguarded
     out2 = inst.compute_logits(x, None)
     assert torch.isinf(out2[1]) and torch.isnan(out2[2])
+
+
+def test_nan_to_num_wrap_cpu_passthrough(monkeypatch):
+    """The 310P torch.nan_to_num shim keeps exact torch semantics on CPU.
+
+    ``aclnnNanToNum`` is not implemented on 310P (EZ1001) and ``== +/-inf``
+    is broken there, so the NPU branch classifies non-finite values by IEEE
+    sign (NaN compares False against both ``> 0`` and ``< 0``).  That op
+    sequence is validated here on CPU; the device guard is the only
+    NPU-specific part and is qualified on-device in the 310P phase.
+    """
+    monkeypatch.setenv("VLLM_OMNI_310P_GLM_TTS_PATCHES", "1")
+    _make_fake_stack(monkeypatch, is_310p_value=True)
+    mod = _fresh_module(monkeypatch, "glm_tts_310p_patch_src9", PATCH_PACKAGE_MARKER / "glm_tts.py")
+    mod.apply_glm_tts_310p_patches()
+
+    wrapped = torch.nan_to_num
+    assert getattr(wrapped, "_310p_nan_to_num_wrapped", False) is True
+
+    x = torch.tensor([1.0, float("nan"), float("inf"), -float("inf")])
+    out = torch.nan_to_num(x, nan=-1e4, posinf=1e4, neginf=-1e4)
+    assert out.tolist() == [1.0, -1e4, 1e4, -1e4]  # CPU: original torch behavior
+
+    # The 310P branch formulation, executed here on a CPU tensor.
+    finite = torch.isfinite(x)
+    out2 = torch.where(
+        finite,
+        x,
+        torch.where(
+            x > 0,
+            torch.tensor(1e4),
+            torch.where(x < 0, torch.tensor(-1e4), torch.tensor(-1e4)),
+        ),
+    )
+    assert out2.tolist() == [1.0, -1e4, 1e4, -1e4]
+
+    mod.apply_glm_tts_310p_patches()  # idempotent: no double wrap
+    assert torch.nan_to_num is wrapped
+
+
+def test_process_shims_install_frontend_pin(monkeypatch):
+    """apply_glm_tts_process_shims must pin the WhisperVQ frontend to CPU in
+    every process — the mm-processor loads it in the main process where the
+    worker-gated model patches never run, and through *both* module
+    namespaces (glm_tts.py binds the name at import time).
+    """
+    monkeypatch.setenv("VLLM_OMNI_310P_GLM_TTS_PATCHES", "1")
+    _make_fake_stack(monkeypatch, is_310p_value=True)
+    mod = _fresh_module(monkeypatch, "glm_tts_310p_patch_src10", PATCH_PACKAGE_MARKER / "glm_tts.py")
+    mod.apply_glm_tts_process_shims()
+
+    from vllm_omni.model_executor.models.glm_tts import voice_clone as vc_mod
+    import vllm_omni.model_executor.models.glm_tts.glm_tts as m_mod
+
+    assert getattr(vc_mod.load_voice_clone_frontend, "_310p_cpu_pinned", False) is True
+    assert m_mod.load_voice_clone_frontend is vc_mod.load_voice_clone_frontend
+    st, cp = vc_mod.load_voice_clone_frontend("/fake", torch.device("meta"))
+    assert vc_mod._calls["devices"] == [torch.device("cpu")]
+    # The STFT mel path must also run on CPU (torch.stft emits complex
+    # tensors, which 310P AclNN cannot represent).
+    feat = m_mod.extract_prompt_feat(torch.zeros(2), 24000, torch.device("meta"))
+    assert vc_mod._calls["feat_devices"] == [torch.device("cpu")]
+    assert feat.device == torch.device("cpu")
+    mod.apply_glm_tts_process_shims()  # idempotent
+    assert vc_mod._calls["devices"] == [torch.device("cpu")]
+
+
+def test_kill_switch_skips_process_shims(monkeypatch):
+    monkeypatch.setenv("VLLM_OMNI_310P_GLM_TTS_PATCHES", "0")
+    _make_fake_stack(monkeypatch, is_310p_value=True)
+    mod = _fresh_module(monkeypatch, "glm_tts_310p_patch_src11", PATCH_PACKAGE_MARKER / "glm_tts.py")
+    mod.apply_glm_tts_process_shims()
+    from vllm_omni.model_executor.models.glm_tts import voice_clone as vc_mod
+
+    assert not getattr(vc_mod.load_voice_clone_frontend, "_310p_cpu_pinned", False)
+    assert mod._PROCESS_SHIM_PATCHED is True  # latched: no per-call retry
 
 
 def test_registry_dispatch_for_glm_tts_arch(monkeypatch):

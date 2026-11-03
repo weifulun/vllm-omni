@@ -20,6 +20,13 @@ def apply_patches() -> None:
     from vllm_omni.platforms.npu._310p.patch.worker import apply_patch
 
     apply_patch()
+    # GLM-TTS process-wide shims: the mm-processor loads the WhisperVQ
+    # voice-clone frontend in the main/orchestrator process, which the
+    # worker-gated model patches never reach.  Runs in every process via
+    # NPUOmniPlatform.__init__; no-op off 310P / under the kill switch.
+    from vllm_omni.platforms.npu._310p.patch.glm_tts import apply_glm_tts_process_shims
+
+    apply_glm_tts_process_shims()
     _WORKER_PATCHED = True
 
 
