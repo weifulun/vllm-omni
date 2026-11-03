@@ -713,6 +713,24 @@ class DiffusionCacheConfig:
         raise AttributeError(f"'{self.__class__.__name__}' object has no attribute '{item}'")
 
 
+def _looks_like_ming_image_design(model: str) -> bool:
+    """Detect the Ming-Image Design checkpoint layout (AR wrapper + DiT + MLP).
+
+    Design checkpoints carry the AR wrapper config.json plus ``transformer/``
+    (vendor DiffusionTransformer) and ``mlp/`` subfolders.  The legacy
+    ming_flash_omni image-gen layout has no ``transformer/`` subfolder and
+    must keep resolving to ``MingImagePipeline``.  Hub ids (non-local paths)
+    always return False to preserve the legacy fallback.
+    """
+    root = str(model)
+    if not os.path.isdir(root):
+        return False
+    return (
+        os.path.isfile(os.path.join(root, "transformer", "config.json"))
+        and os.path.isfile(os.path.join(root, "mlp", "config.json"))
+    )
+
+
 def resolve_model_class_name(
     model: str | None,
     diffusion_load_format: str = "default",
@@ -774,6 +792,11 @@ def resolve_model_class_name(
         "ming_flash_omni",
         "ming_flash_omni_thinker",
     ):
+        # Ming-Image Design (AR wrapper + transformer/ + mlp/ subfolders) must
+        # dispatch to the Design diffusion pipeline; the legacy ming_flash_omni
+        # image-gen layout keeps MingImagePipeline.
+        if _looks_like_ming_image_design(model):
+            return "MingImageDiffusionPipeline"
         return "MingImagePipeline"
     if model_type == "nextstep":
         return "NextStep11Pipeline"
