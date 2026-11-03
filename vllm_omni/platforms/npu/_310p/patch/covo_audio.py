@@ -76,6 +76,7 @@ _FP32_SCORES_BUDGET = 1 << 26
 
 _STAGE0_PATCHED = False
 _STAGE1_PATCHED = False
+_ROPE_STORAGE_READY = False
 
 
 def _patches_disabled() -> bool:
@@ -160,44 +161,98 @@ class _FShim:
 # ---------------------------------------------------------------------------
 
 
+def _rope_storage_capacity() -> int:
+    """Stable-storage capacity: max_num_batched_tokens (vendor set_cos_and_sin
+    caliber), with a conservative fallback when the config is unreachable."""
+    try:
+        from vllm.config import get_current_vllm_config_or_none
+
+        cfg = get_current_vllm_config_or_none()
+        mntb = getattr(getattr(cfg, "scheduler_config", None), "max_num_batched_tokens", None)
+        if mntb:
+            return int(mntb)
+    except Exception:
+        pass
+    return 8192
+
+
+def _ensure_rope_storage(rot, rm_ops, query) -> None:
+    """Bootstrap the OOT rope stable storage for VL-class models.
+
+    ``vllm_ascend.ops.rotary_embedding.set_cos_and_sin`` allocates the
+    ``_cos``/``_sin`` buffers only when ``not is_vl_model(...)``; Covo's
+    multimodal config (hf_config != hf_text_config) is classified VL, so the
+    buffers are never allocated and every ``update_cos_sin`` call in the
+    model runners (V1 ``_dummy_run``/``execute_model`` and V2) is a silent
+    no-op -> the head_size == 128 branch of ``_rope_forward_oot`` passes
+    null cos/sin into ``npu_apply_rotary_pos_emb`` (CANN 161001
+    AclNN_Parameter_Error(EZ1001) "Check cos != nullptr failed").
+
+    Allocate the buffers on ``query``'s device/dtype (the NPU fp16 compute
+    dtype, not the fp32 CPU construction dtype of ``rot.cos_sin_cache``,
+    which the vendor only moves to the query device *inside* the wrapped
+    ``orig``) and record the rotary's cos/sin cache if it was not recorded;
+    afterwards the runners' per-forward ``update_cos_sin`` fills the slices
+    as designed (``copy_`` handles any residual dtype/device cast).
+    """
+    global _ROPE_STORAGE_READY
+    if _ROPE_STORAGE_READY or rm_ops._cos is not None:
+        return
+    cache = getattr(rot, "cos_sin_cache", None)
+    if cache is None:
+        return  # nothing to bootstrap; let the vendor error surface as-is
+    if rm_ops._cos_sin_cache is None:
+        rm_ops._record_cos_sin_cache(cache)
+    if rm_ops._cos_sin_cache is None:
+        return  # nothing recorded; let the vendor error surface as-is
+    capacity = _rope_storage_capacity()
+    # capacity must index >= any forward's token count; the vendor caliber
+    # is max_num_batched_tokens, which also bounds positions.size(0).
+    rope_dim = int(getattr(rot, "rotary_dim", cache.shape[-1]))
+    rm_ops._cos = torch.ones(
+        1, capacity, 1, rope_dim, dtype=query.dtype, device=query.device
+    )
+    rm_ops._sin = torch.zeros(
+        1, capacity, 1, rope_dim, dtype=query.dtype, device=query.device
+    )
+    _ROPE_STORAGE_READY = True
+
+
 def _patch_rope_cos_sin_refresh_for_310p() -> None:
-    """Refresh the OOT rope cos/sin slices on every forward (V1 runner gap).
+    """Make the OOT rope cos/sin storage usable under the V1 runner.
 
-    ``vllm_ascend._310p.ops.rotary_embedding`` keeps the cos/sin pair in
-    module-global stable storage; ``update_cos_sin`` fills it, and the only
-    production call site is the V2 model runner
-    (``vllm_ascend._310p.worker.v2.model_runner``).  310P AR lines run the
-    V1 runner ("Model Runner V2 does not yet support 310P"), so the storage
-    is never filled and the head_size == 128 branch of
-    ``_rope_forward_oot`` passes null cos/sin into
-    ``npu_apply_rotary_pos_emb`` -> CANN 161001 AclNN_Parameter_Error(EZ1001)
-    "Check cos != nullptr failed".
-
-    Rewrap the module-global ``_rope_forward_oot`` (runtime module-attr
-    rebind; importing the symbol and reassigning locally would be a no-op by
-    the symbol-swap trap, research/012) so each forward refreshes the
-    storage from the recorded cos/sin cache before delegating.  The refresh
-    is skipped when the drafting flag is set (the spec-decode proposers
-    toggle it around their own refresh).
+    ``vllm_ascend._310p.ops.rotary_embedding`` reads the cos/sin pair from
+    module-global stable storage in ``vllm_ascend.ops.rotary_embedding``;
+    for VL-class models that storage is never allocated (see
+    ``_ensure_rope_storage``), so the refresh must be bootstrapped from the
+    rope forward itself.  The module-global ``_rope_forward_oot`` is
+    rewrapped (runtime module-attr rebind; importing the symbol and
+    reassigning locally would be a no-op by the symbol-swap trap,
+    research/012) so each forward ensures the storage and refreshes the
+    slices before delegating.  The refresh is skipped when the drafting
+    flag is set (the spec-decode proposers toggle it around their own
+    refresh).
     """
     try:
-        from vllm_ascend._310p.ops import rotary_embedding as _rm
+        from vllm_ascend._310p.ops import rotary_embedding as rm_310
+        from vllm_ascend.ops import rotary_embedding as rm_ops
     except Exception:  # bare host without vllm_ascend (contract tests)
-        _log("stage0: vllm_ascend._310p.ops.rotary_embedding unavailable; rope refresh skipped")
+        _log("stage0: vllm_ascend rotary modules unavailable; rope refresh skipped")
         return
 
-    orig = _rm._rope_forward_oot
+    orig = rm_310._rope_forward_oot
     if getattr(orig, "_covo_310p_rope_refresh", False):
         return  # already wrapped (idempotency)
 
     def _rope_forward_oot_refresh(self, positions, query, key, is_neox_style, offsets=None):
         if offsets is None and not getattr(type(self), "_is_drafting_update_enabled", False):
-            _rm.update_cos_sin(positions)
+            _ensure_rope_storage(self, rm_ops, query)
+            rm_310.update_cos_sin(positions)
         return orig(self, positions, query, key, is_neox_style, offsets)
 
     _rope_forward_oot_refresh._covo_310p_rope_refresh = True  # type: ignore[attr-defined]
-    _rm._rope_forward_oot = _rope_forward_oot_refresh
-    _log("stage0: OOT rope cos/sin per-forward refresh installed (V1 runner gap)")
+    rm_310._rope_forward_oot = _rope_forward_oot_refresh
+    _log("stage0: OOT rope cos/sin bootstrap + per-forward refresh installed (VL-class gap)")
 
 
 def apply_stage0_patches(model_config) -> None:

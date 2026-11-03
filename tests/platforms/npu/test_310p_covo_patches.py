@@ -57,7 +57,8 @@ def _load_dispatcher(name: str = "covo_dispatch_under_test"):
 
 
 def _install_fake_rotary_embedding(monkeypatch: pytest.MonkeyPatch):
-    """Fake vllm_ascend._310p.ops.rotary_embedding with a recording orig."""
+    """Fake both vllm_ascend._310p.ops.rotary_embedding (recording orig) and
+    vllm_ascend.ops.rotary_embedding (the stable-storage base module)."""
     calls = {"update": 0, "forward": 0}
 
     def update_cos_sin(positions):
@@ -71,21 +72,40 @@ def _install_fake_rotary_embedding(monkeypatch: pytest.MonkeyPatch):
     mod.update_cos_sin = update_cos_sin
     mod._rope_forward_oot = orig_rope
 
+    # Base stable-storage module (vllm_ascend.ops.rotary_embedding) as the
+    # patch reads/writes it: _cos/_sin/_cos_sin_cache + _record_cos_sin_cache.
+    ops_mod = types.ModuleType("vllm_ascend.ops.rotary_embedding")
+    ops_mod._cos = None
+    ops_mod._sin = None
+    ops_mod._cos_sin_cache = None
+
+    def _record_cos_sin_cache(cache):
+        if ops_mod._cos_sin_cache is None:
+            ops_mod._cos_sin_cache = cache
+
+    ops_mod._record_cos_sin_cache = _record_cos_sin_cache
+
     pkg_ascend = types.ModuleType("vllm_ascend")
     pkg_ascend.__path__ = []
     pkg_310 = types.ModuleType("vllm_ascend._310p")
     pkg_310.__path__ = []
     pkg_ops = types.ModuleType("vllm_ascend._310p.ops")
     pkg_ops.__path__ = []
+    pkg_base_ops = types.ModuleType("vllm_ascend.ops")
+    pkg_base_ops.__path__ = []
     pkg_ascend._310p = pkg_310
+    pkg_ascend.ops = pkg_base_ops
     pkg_310.ops = pkg_ops
     pkg_ops.rotary_embedding = mod
+    pkg_base_ops.rotary_embedding = ops_mod
 
     monkeypatch.setitem(sys.modules, "vllm_ascend", pkg_ascend)
     monkeypatch.setitem(sys.modules, "vllm_ascend._310p", pkg_310)
     monkeypatch.setitem(sys.modules, "vllm_ascend._310p.ops", pkg_ops)
     monkeypatch.setitem(sys.modules, "vllm_ascend._310p.ops.rotary_embedding", mod)
-    return mod, calls
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops", pkg_base_ops)
+    monkeypatch.setitem(sys.modules, "vllm_ascend.ops.rotary_embedding", ops_mod)
+    return mod, ops_mod, calls
 
 
 def _install_fake_alias_free(monkeypatch: pytest.MonkeyPatch):
@@ -322,7 +342,7 @@ def test_stage0_installs_rope_cos_sin_refresh(monkeypatch):
     the refresh wrapper the head_size-128 branch of _rope_forward_oot passes
     null cos/sin into npu_apply_rotary_pos_emb (CANN 161001, EZ1001).
     """
-    fake_rot, calls = _install_fake_rotary_embedding(monkeypatch)
+    fake_rot, _fake_ops, calls = _install_fake_rotary_embedding(monkeypatch)
     mod = _load_covo_patch()
     cfg = SimpleNamespace(hf_config=SimpleNamespace(encoder_config=SimpleNamespace()))
     mod.apply_stage0_patches(cfg)
@@ -345,7 +365,7 @@ def test_stage0_installs_rope_cos_sin_refresh(monkeypatch):
 
 def test_rope_refresh_skips_update_when_drafting_flag_set(monkeypatch):
     """The wrapper must not double-refresh when the runner already does."""
-    fake_rot, calls = _install_fake_rotary_embedding(monkeypatch)
+    fake_rot, _fake_ops, calls = _install_fake_rotary_embedding(monkeypatch)
     mod = _load_covo_patch()
     mod.apply_stage0_patches(
         SimpleNamespace(hf_config=SimpleNamespace(encoder_config=SimpleNamespace()))
@@ -359,3 +379,41 @@ def test_rope_refresh_skips_update_when_drafting_flag_set(monkeypatch):
     wrapped(_DraftingRotary(), positions, torch.ones(8, 4), torch.ones(8, 4), False)
     assert calls["update"] == 0, "drafting path already refreshes cos/sin"
     assert calls["forward"] == 1
+
+
+def test_rope_storage_bootstrap_seeds_vl_class_storage(monkeypatch):
+    """VL-class gap: the vendor never allocates the OOT rope stable storage
+    for multimodal configs (set_cos_and_sin skips is_vl_model), so the
+    bootstrap must seed _cos/_sin on the query's device/dtype and record the
+    rotary's cos/sin cache before update_cos_sin fills the slices."""
+    fake_rot, fake_ops, calls = _install_fake_rotary_embedding(monkeypatch)
+    mod = _load_covo_patch()
+    mod.apply_stage0_patches(
+        SimpleNamespace(hf_config=SimpleNamespace(encoder_config=SimpleNamespace()))
+    )
+
+    class _VLRotary:
+        rotary_dim = 128
+        cos_sin_cache = torch.randn(64, 128)  # fp32/CPU as at construction
+
+    wrapped = fake_rot._rope_forward_oot
+    positions = torch.arange(8, dtype=torch.long)
+    query = torch.ones(8, 128, dtype=torch.float16)  # NPU fp16 stand-in
+    wrapped(_VLRotary(), positions, query, query, True)
+
+    assert calls["update"] == 1
+    assert fake_ops._cos_sin_cache is _VLRotary.cos_sin_cache
+    assert fake_ops._cos is not None and fake_ops._sin is not None
+    # Seeded on the query's dtype (fp16), not the fp32 construction cache.
+    assert fake_ops._cos.dtype == torch.float16
+    assert fake_ops._sin.dtype == torch.float16
+    # (1, capacity, 1, rotary_dim); capacity follows the vendor caliber
+    # (scheduler max_num_batched_tokens when an engine context is active,
+    # conservative fallback otherwise).
+    cap = mod._rope_storage_capacity()
+    assert cap >= 2048
+    assert tuple(fake_ops._cos.shape) == (1, cap, 1, 128)
+    # Idempotency: a second forward must not re-allocate.
+    before = fake_ops._cos
+    wrapped(_VLRotary(), positions, query, query, True)
+    assert fake_ops._cos is before
