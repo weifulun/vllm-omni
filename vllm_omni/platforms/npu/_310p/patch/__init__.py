@@ -13,6 +13,7 @@ logger = logging.getLogger(__name__)
 _WORKER_PATCHED = False
 _QWEN3_TTS_TALKER_ARCH = "Qwen3TTSTalkerForConditionalGeneration"
 _QWEN3_TTS_CODE2WAV_ARCH = "Qwen3TTSCode2Wav"
+_MING_IMAGE_AR_ARCH = "MingImageForConditionalGeneration"
 
 # Diffusion 310P patch registry (COMPARISON-POLICY.md §5):
 # od_config.model_class_name -> patch modules applied (in order) before the
@@ -251,3 +252,11 @@ def apply_model_patches(model_config) -> None:
         from vllm_omni.platforms.npu._310p.patch.qwen3_tts import apply_code2wav_patches
 
         apply_code2wav_patches()
+    elif model_arch == _MING_IMAGE_AR_ARCH:
+        # Ming-Image stage-0 MLLM (17.0B MoE BailingMoeV2 backbone): pin the
+        # decoder-layer norms to the HF pre-add RMSNorm convention (task-27
+        # FP16 sum-norm overflow, report §3.1 #4).  Stage-1 diffusion keeps
+        # the generic 310P diffusion patch.
+        from vllm_omni.platforms.npu._310p.patch.ming_image_ar import apply_ming_image_ar_patches
+
+        apply_ming_image_ar_patches()
