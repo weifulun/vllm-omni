@@ -14,7 +14,13 @@ untouched; only the registry line + this module are added by this branch):
   16.4GB of the 21.08GiB chip, so the 11.36GB encoder cannot co-reside;
   CPU FP32 follows the 310P SoC CPU compute discipline (ENV-PRECHECK P1-11:
   CPU FP16 GEMM pathology ~80x slower); prompt embeds are moved back to the
-  NPU in the runtime FP16 dtype;
+  NPU in the runtime FP16 dtype.  The pin must hold *during construction*:
+  the base ``__init__`` runs ``text_encoder.to(self.device)`` and only then
+  builds the 10.54GB DiT, so a post-construction pin alone OOMs at ~19.4GB
+  (measured on 125 C1).  The 310P subclass therefore shadows the encoder's
+  ``nn.Module.to`` right after ``_load_text_encoder`` so the NPU device
+  request degrades to CPU (dtype conversions still apply), and restores the
+  stock method after construction;
 * route the pipeline's custom ``encode_prompt`` (which unlike Z-Image does
   not use the base ``_encode_prompt``) through the encoder-side device, and
   set ``_encoder_device`` so the shared HF-encoder offload hook
@@ -63,6 +69,54 @@ def _encoder_on_npu() -> bool:
     return os.environ.get(_ENCODER_ON_NPU_ENV, "0") == "1"
 
 
+def _is_npu_device(x: object) -> bool:
+    """True if a device spec (``str`` or ``torch.device``) targets the NPU.
+
+    Parsed without constructing a ``torch.device`` from the string, so this
+    is safe on CPU-only hosts where ``torch.device("npu")`` raises.
+    """
+    if isinstance(x, torch.device):
+        return x.type == "npu"
+    if isinstance(x, str):
+        return x.split(":", 1)[0] == "npu"
+    return False
+
+
+def _pin_encoder_to_cpu(encoder: torch.nn.Module) -> None:
+    """Shadow ``nn.Module.to`` so NPU device requests degrade to CPU.
+
+    The 11.36GB UMT5-XXL encoder must never become NPU-resident on a single
+    310P chip: the base pipeline moves it to ``self.device`` inside
+    ``__init__`` and only then constructs the 10.54GB DiT, so the two
+    co-reside during construction (24.7GB > 21.08GiB — measured OOM at
+    19.42GiB allocated on 125 C1).  The stock method is shadowed as an
+    instance attribute; dtype conversions still apply, device requests that
+    target the NPU are rewritten to CPU, and everything else passes through
+    unchanged.  Restore with :func:`_unpin_encoder`.
+    """
+    original_to = encoder.to
+
+    def _cpu_only_to(*args, **kwargs):
+        if args and _is_npu_device(args[0]):
+            args = ("cpu",) + args[1:]
+        requested_kw = kwargs.get("device")
+        if requested_kw is not None and _is_npu_device(requested_kw):
+            kwargs["device"] = "cpu"
+        return original_to(*args, **kwargs)
+
+    encoder.to = _cpu_only_to
+    encoder._310p_original_to = original_to
+
+
+def _unpin_encoder(encoder: torch.nn.Module) -> None:
+    """Restore the stock ``nn.Module.to`` after the pinned window."""
+    original_to = getattr(encoder, "_310p_original_to", None)
+    if original_to is None:
+        return
+    encoder.to = original_to
+    del encoder._310p_original_to
+
+
 class _ABotWorldCausal310P(ABotWorldCausalPipeline):
     """ABot-World causal DMD pipeline specialized for the 310P NPU path.
 
@@ -105,6 +159,10 @@ class _ABotWorldCausal310P(ABotWorldCausalPipeline):
             self._encoder_device = self.device
         else:
             self._encoder_device = _CPU_DEVICE
+            # The construction-time pin (``_load_text_encoder``) kept the
+            # encoder on CPU across ``super().__init__``; restore the stock
+            # ``.to`` before the P1-11 FP32 conversion below.
+            _unpin_encoder(self.text_encoder)
             self.text_encoder.to(device=_CPU_DEVICE, dtype=torch.float32)
             logger.info(
                 "[310P] ABot-World text encoder pinned to CPU (FP32); embeds moved to %s in %s.",
@@ -112,6 +170,30 @@ class _ABotWorldCausal310P(ABotWorldCausalPipeline):
                 _RUNTIME_DTYPE,
             )
         maybe_install_phase_tracer(self, self.device)
+
+    def _load_text_encoder(self, model: str, dtype: torch.dtype) -> torch.nn.Module:
+        """Load the UMT5-XXL encoder (CPU, as the base does) and, unless the
+        on-NPU opt-out is set, pin it to CPU before the base ``__init__`` can
+        move it.
+
+        The stock ``__init__`` sequence is::
+
+            self.text_encoder = self._load_text_encoder(model_path, dtype)
+            if not managed_offload:
+                self.text_encoder = self.text_encoder.to(self.device)   # NPU
+            ...
+            self.transformer = self._create_transformer(model_path)     # +10.54GB NPU
+
+        i.e. the 11.36GB encoder and the 10.54GB DiT co-reside on the chip
+        during construction — 24.7GB on a 21.08GiB single chip (measured OOM
+        at 19.42GiB allocated, 125 C1).  Pinning here makes the ``.to()`` on
+        the base line a CPU no-op; the encoder ends the rollout exactly where
+        the post-construction pin would have put it.
+        """
+        encoder = super()._load_text_encoder(model, dtype)
+        if not _encoder_on_npu():
+            _pin_encoder_to_cpu(encoder)
+        return encoder
 
     def encode_prompt(self, prompt: str, *, max_sequence_length: int, dtype: torch.dtype) -> torch.Tensor:
         """Base implementation with encoder-side device routing (CPU by default
@@ -136,7 +218,11 @@ class _ABotWorldCausal310P(ABotWorldCausalPipeline):
         attention_mask = text_inputs.attention_mask.to(encoder_device)
         embeds = self.text_encoder(input_ids, attention_mask).last_hidden_state
         embeds = embeds.to(device=self.device, dtype=dtype)
-        return embeds * attention_mask.unsqueeze(-1).to(dtype=embeds.dtype)
+        # The pad-zeroing multiply happens on the execution device: move the
+        # mask back before casting (a CPU mask x NPU embeds would trip the
+        # same-device check inside mul).
+        mask = attention_mask.to(device=self.device, dtype=dtype).unsqueeze(-1)
+        return embeds * mask
 
 
 def apply_diffusion_310p_patches(od_config) -> None:

@@ -302,6 +302,12 @@ class _FakeEncoder(torch.nn.Module):
 def _fake_abot_base(monkeypatch: pytest.MonkeyPatch):
     import torch.nn as nn
 
+    # The 310P execution device as seen by the base pipeline's
+    # ``text_encoder.to(self.device)`` line.  The real runtime passes a
+    # ``torch.device("npu", i)``; the string stand-in routes through the
+    # same ``_is_npu_device`` branch in the 310P pin's shadow.
+    _NPU_CONSTRUCTION_SPEC = "npu:0"
+
     class _Base(nn.Module):
         def __init__(self, *, od_config, prefix: str = ""):
             super().__init__()
@@ -309,9 +315,18 @@ def _fake_abot_base(monkeypatch: pytest.MonkeyPatch):
             self.construction_dtype = torch.get_default_dtype()
             self.device = torch.device("cpu")  # execution-device stand-in
             self.tokenizer = _FakeTokenizer()
-            self.text_encoder = _FakeEncoder()
+            # Mirror the stock ABotWorldCausalPipeline.__init__ encoder flow:
+            # _load_text_encoder (CPU) -> .to(execution device) BEFORE the DiT
+            # is built.  With the 310P pin the npu spec is rewritten to CPU
+            # inside the shadow; without it (opt-out) a CPU-only host raises —
+            # the emulated NPU move is installed by the opt-out test.
+            self.text_encoder = self._load_text_encoder("model", torch.float16)
+            self.text_encoder = self.text_encoder.to(_NPU_CONSTRUCTION_SPEC)
             self.vae = nn.Linear(4, 4)
             self.transformer = nn.Linear(4, 4)
+
+        def _load_text_encoder(self, model, dtype):
+            return _FakeEncoder()
 
     _install_fake_module(
         monkeypatch, "vllm_omni.diffusion.models.abot_world.pipeline_abot_world",
@@ -403,11 +418,71 @@ def test_abot_encoder_pinned_cpu_fp32(monkeypatch: pytest.MonkeyPatch):
         assert p.dtype == torch.float32
 
 
+def test_abot_encoder_pin_blocks_npu_move_during_construction(monkeypatch: pytest.MonkeyPatch):
+    """The pin must hold across the base __init__'s ``text_encoder.to(npu)``:
+    the encoder ends construction CPU-resident, never NPU-resident."""
+    mod, pipeline = _build_310p_pipeline(monkeypatch, _make_od_config(dtype=torch.float16))
+    # The base-line ``.to("npu:0")`` would have raised on a CPU-only host
+    # without the pin's shadow; with it the encoder survives construction
+    # CPU-resident and the post-construction P1-11 conversion lands FP32.
+    for p in pipeline.text_encoder.parameters():
+        assert p.device.type == "cpu"
+        assert p.dtype == torch.float32
+    assert not hasattr(pipeline.text_encoder, "_310p_original_to")
+
+
+def test_abot_encoder_pin_shadow_unit(monkeypatch: pytest.MonkeyPatch):
+    """Direct mechanism test of _pin_encoder_to_cpu/_unpin_encoder."""
+    mod, _ = _load_abot_module(monkeypatch)
+    m = torch.nn.Linear(4, 4)
+    mod._pin_encoder_to_cpu(m)
+    # NPU positional device spec is rewritten to CPU; dtype still applies.
+    out = m.to("npu:0", dtype=torch.float16)
+    assert out is m
+    assert all(p.device.type == "cpu" for p in m.parameters())
+    assert all(p.dtype == torch.float16 for p in m.parameters())
+    # NPU kwarg device spec is rewritten too; cpu specs pass through.
+    m.to(device="npu", dtype=torch.float32)
+    assert all(p.dtype == torch.float32 for p in m.parameters())
+    m.to(torch.device("cpu"))
+    assert all(p.device.type == "cpu" for p in m.parameters())
+    # Unpin restores the stock bound method and drops the bookkeeping attr.
+    mod._unpin_encoder(m)
+    assert not hasattr(m, "_310p_original_to")
+    # The stock method is back: an npu spec now behaves as stock — it raises
+    # on a CPU-only host and actually moves on a torch_npu runtime.
+    try:
+        import torch_npu  # noqa: F401
+        has_npu = True
+    except ImportError:
+        has_npu = False
+    if has_npu:
+        m.to("npu:0")
+        assert all(p.device.type == "npu" for p in m.parameters())
+        m.to("cpu")
+    else:
+        with pytest.raises(RuntimeError):
+            m.to("npu:0")
+    # Idempotent: unpinned unpin is a no-op.
+    mod._unpin_encoder(m)
+
+
 def test_abot_encoder_on_npu_opt_out(monkeypatch: pytest.MonkeyPatch):
-    mod, pipeline = _build_310p_pipeline(
-        monkeypatch, _make_od_config(dtype=torch.float16), encoder_on_npu_env="1"
-    )
+    mod, _ = _load_abot_module(monkeypatch)
+    monkeypatch.setenv("VLLM_OMNI_310P_ABOT_ENCODER_ON_NPU", "1")
+    # Emulate the host-side NPU move the stock .to would perform: record the
+    # requested device and stay CPU-resident (CPU-only torch cannot target NPU).
+    moved_to = []
+
+    def _fake_to(self, *args, **kwargs):
+        moved_to.append(args[0] if args else kwargs.get("device"))
+        return self
+
+    monkeypatch.setattr(torch.nn.Module, "to", _fake_to)
+    pipeline = mod._ABotWorldCausal310P(od_config=_make_od_config(dtype=torch.float16))
     assert pipeline._encoder_device == pipeline.device
+    # Opt-out: the base-line NPU move was NOT intercepted (no pin installed).
+    assert moved_to and moved_to[0] == "npu:0"
 
 
 def test_abot_encode_prompt_routes_through_encoder_device(monkeypatch: pytest.MonkeyPatch):
